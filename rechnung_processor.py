@@ -54,17 +54,19 @@ CONFIG = {
     "excel_datei": "Rechnungsuebersicht.xlsx"
 }
 
-# Bekannte Lieferanten mit korrekten Umlauten
+# Bekannte Lieferanten mit korrekten Umlauten - SPEZIFISCHE zuerst!
 LIEFERANTEN_MAP = {
+    # Spezifische Treffer zuerst (längere/genaue Strings)
+    're-invent retail': 'RE-INvent Retail',
+    'voelkner': 'Voelkner',
+    'steinke': 'Steinke',
     'ttcher': 'Böttcher',
     'bottcher': 'Böttcher',
     'stadtwerke wittenberge': 'Stadtwerke Wittenberge',
+    # Allgemeine Treffer zuletzt
     'stadtwerke': 'Stadtwerke',
     'wittenberge': 'Stadtwerke Wittenberge',
-    're-invent': 'RE-INvent',
     'invent': 'RE-INvent',
-    'voelkner': 'Voelkner',
-    'steinke': 'Steinke'
 }
 
 # Stoppwörter
@@ -91,28 +93,56 @@ def format_betrag(betrag):
 
 
 def finde_lieferant(text):
-    """Extrahiert den Lieferanten aus dem Text (mit Umlaut-Fix)"""
+    """Extrahiert den Lieferanten aus dem Text - verbesserte Version"""
     text_lower = text.lower()
     
-    # Prüfe auf bekannte Lieferanten
-    for key, value in LIEFERANTEN_MAP.items():
-        if key.lower() in text_lower:
-            return value
+    # PRÜFE: Ist G.E.S. der Empfänger (Lieferant = jemand anderes)?
+    # Suche nach Mustern wie "Rechnung [Lieferant]" oder Lieferant über Empfänger
+    lines = text.split('\n')
     
-    # Suche nach Firmen mit GmbH/AG/KG
-    firma_muster = re.compile(r'([A-ZÄÖÜ][a-zäöüßA-ZÄÖÜ\s]{2,40}(?:GmbH|AG|KG|OHG|e\.?K|UG))', re.IGNORECASE)
-    match = firma_muster.search(text)
-    if match:
-        kandidat = match.group(1).strip()
-        if not any(wort in text_lower for wort in STOPP_WORTER):
+    # 1. Suche explizit nach "Rechnung" + Firma (Lieferanten)
+    # Muster: "Rechnung\nFirma GmbH" oder "Rechnung Firma GmbH"
+    rechnung_pattern = re.search(r'ReCHNUNG\s*\n?\s*([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', text, re.IGNORECASE)
+    if rechnung_pattern:
+        kandidat = rechnung_pattern.group(1).strip()
+        if 'G.E.S.' not in kandidat and 'Energietechnik' not in kandidat:
             return bereinige_lieferant(kandidat)
     
-    # Erste Zeilen durchgehen
-    zeilen = [z.strip() for z in text.splitlines() if z.strip()]
-    for zeile in zeilen[:15]:
+    # 2. Prüfe bekannte Lieferanten in Reihenfolge (spezifische zuerst)
+    for key, value in LIEFERANTEN_MAP.items():
+        if key.lower() in text_lower:
+            # Prüfe dass es nicht G.E.S. selbst ist
+            if 'G.E.S.' not in value and 'Energietechnik' not in value:
+                return value
+    
+    # 3. Suche nach Firma die G.E.S. beliefert (nicht G.E.S. selbst)
+    # Suche Abschnitte mit "Rechnung" und dann Firmenname
+    rechnung_sections = re.split(r'ReCHNUNG', text, flags=re.IGNORECASE)
+    if len(rechnung_sections) > 1:
+        # Nimm den Teil nach "Rechnung"
+        after_rechnung = rechnung_sections[1][:500]  # Erste 500 Zeichen
+        firmen = re.findall(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', after_rechnung)
+        for firma in firmen:
+            firma_clean = firma.strip()
+            if len(firma_clean) > 5 and 'G.E.S' not in firma_clean and 'Energietechnik' not in firma_clean:
+                if not any(stop in firma_clean.lower() for stop in STOPP_WORTER):
+                    return bereinige_lieferant(firma_clean)
+    
+    # 4. Suche nach Absender (nicht Empfänger)
+    # Muster: Absender oben, Empfänger mit "Herrn" oder Adresse unten
+    absender_section = '\n'.join(lines[:10])  # Erste 10 Zeilen = meist Absender
+    firmen_absender = re.findall(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', absender_section)
+    for firma in firmen_absender:
+        firma_clean = firma.strip()
+        if len(firma_clean) > 5 and 'G.E.S' not in firma_clean and 'Energietechnik' not in firma_clean:
+            if not any(stop in firma_clean.lower() for stop in STOPP_WORTER):
+                return bereinige_lieferant(firma_clean)
+    
+    # 5. Fallback: Erste Zeilen durchgehen
+    for zeile in lines[:15]:
         if re.search(r'\b(GmbH|AG|KG|OHG|e\.?K|UG)\b', zeile, re.IGNORECASE):
             bereinigt = bereinige_lieferant(zeile)
-            if len(bereinigt) > 3:
+            if len(bereinigt) > 3 and 'G.E.S' not in bereinigt:
                 zeile_lower = zeile.lower()
                 if not any(wort in zeile_lower for wort in STOPP_WORTER):
                     return bereinigt
@@ -139,82 +169,89 @@ def bereinige_lieferant(name):
 
 
 def finde_gesamtpreis(text):
-    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version"""
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version v2"""
     text_lower = text.lower()
+    alle_kandidaten = []
     
-    # 1. HÖCHSTE Priorität: "Summe Bruttowert" (Voelkner-Style)
+    # 0. ERSTE Priorität: "noch zu zahlender Betrag" / "Rechnungsbetrag" (die finale Summe!)
+    zahlungs_patterns = [
+        (r'(?:noch\s+zu\s+zahlender\s+betrag|rechnungsbetrag)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 100),
+        (r'(?:zu\s*zahlen|fällig)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 90),
+        (r'zahlbar[^\d]{0,100}(\d{1,3}(?:\.\d{3})*,\d{2})', 80),
+    ]
+    for pattern, prio in zahlungs_patterns:
+        matches = list(re.finditer(pattern, text, re.IGNORECASE))
+        for m in matches:
+            betrag = parse_betrag(m.group(1))
+            if 0 < betrag < 50000:
+                alle_kandidaten.append((betrag, prio, m.group(1), "zahlung"))
+    
+    # 1. "Summe Bruttowert" (Voelkner-Style)
     match = re.search(r'summe\s+bruttowert[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
     if match:
         betrag = parse_betrag(match.group(1))
         if 0 < betrag < 50000:
-            return {"betrag": betrag, "original": match.group(1), "typ": "brutto_explicit"}
+            alle_kandidaten.append((betrag, 95, match.group(1), "bruttowert"))
     
-    # 2. "Gesamtbetrag" gefolgt von Betrag (mehrere Varianten)
-    gesamt_patterns = [
-        r'gesamtbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'gesamtbetrag[:\s]*\n?\s*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'endbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'rechnungsbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+    # 2. "Endbetrag brutto" / "Gesamtbetrag brutto"
+    brutto_patterns = [
+        r'(?:endbetrag|gesamtbetrag)\s+brutto[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
     ]
-    for pattern in gesamt_patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
-        if match:
-            betrag = parse_betrag(match.group(1))
+    for pattern in brutto_patterns:
+        matches = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE))
+        for m in matches:
+            betrag = parse_betrag(m.group(1))
             if 0 < betrag < 50000:
-                return {"betrag": betrag, "original": match.group(1), "typ": "gesamtbetrag"}
+                alle_kandidaten.append((betrag, 85, m.group(1), "brutto_explicit"))
     
-    # 3. "zu zahlen" / "fällig" / "zahlbar" mit höherem Betrag
-    zahlbar_matches = list(re.finditer(r'(?:zu\s*zahlen|fällig|zahlbar|noch\s*zu\s*zahlend)[^\d]{0,100}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
-    if zahlbar_matches:
-        # Nimm den höchsten "zu zahlen" Betrag (das ist meist Brutto)
-        betraege = [(m, parse_betrag(m.group(1))) for m in zahlbar_matches if 0 < parse_betrag(m.group(1)) < 50000]
+    # 3. Generische "Gesamtbetrag" - sammle ALLE und nimm den HÖCHSTEN
+    # (weil oft: erster = Netto, letzter = Brutto)
+    gesamt_matches = list(re.finditer(r'gesamtbetrag[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
+    if len(gesamt_matches) > 1:
+        # Mehrere "Gesamtbetrag" gefunden - nimm den HÖCHSTEN (vermutlich Brutto)
+        betraege = [(parse_betrag(m.group(1)), m.group(1)) for m in gesamt_matches if 0 < parse_betrag(m.group(1)) < 50000]
         if betraege:
-            best_match = max(betraege, key=lambda x: x[1])
-            return {"betrag": best_match[1], "original": best_match[0].group(1), "typ": "zuzahlen"}
-    
-    # 4. Wenn "Netto" gefunden wird → suche höheren Betrag danach
-    netto_matches = list(re.finditer(r'(?:netto|gesamt\s*netto|warenwert)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
-    if netto_matches:
-        netto_values = [(m, parse_betrag(m.group(1))) for m in netto_matches if 0 < parse_betrag(m.group(1)) < 50000]
-        if netto_values:
-            netto_match, netto_betrag = max(netto_values, key=lambda x: x[1])
-            
-            # Suche nach höherem Betrag im Kontext danach
-            context_nach = text[netto_match.end():netto_match.end()+800]
-            brutto_candidates = []
-            for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', context_nach):
-                b = parse_betrag(m.group(1))
-                # Brutto ist typischerweise 10-30% höher als Netto
-                if netto_betrag * 1.1 < b < netto_betrag * 1.5:
-                    brutto_candidates.append(b)
-            
-            if brutto_candidates:
-                brutto = max(brutto_candidates)
-                return {"betrag": brutto, "original": format_betrag(brutto), "typ": "berechnet_brutto"}
-            else:
-                # Fallback: Suche höchsten Betrag in ganzer Rechnung
-                all_betraege = []
-                for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', text):
-                    b = parse_betrag(m.group(1))
-                    if 0 < b < 50000:
-                        all_betraege.append(b)
-                if all_betraege:
-                    max_betrag = max(all_betraege)
-                    if max_betrag > netto_betrag:
-                        return {"betrag": max_betrag, "original": format_betrag(max_betrag), "typ": "max_vs_netto"}
-    
-    # 5. Fallback: Höchster realistischer Betrag
-    betrag_muster = re.compile(r'(\d{1,3}(?:\.\d{3})*,\d{2})')
-    betraege = []
-    
-    for match in betrag_muster.finditer(text):
-        betrag = parse_betrag(match.group(1))
+            max_betrag, original = max(betraege, key=lambda x: x[0])
+            alle_kandidaten.append((max_betrag, 70, original, "gesamtbetrag_max"))
+    elif gesamt_matches:
+        betrag = parse_betrag(gesamt_matches[0].group(1))
         if 0 < betrag < 50000:
-            betraege.append(betrag)
+            alle_kandidaten.append((betrag, 70, gesamt_matches[0].group(1), "gesamtbetrag"))
     
-    if betraege:
-        max_betrag = max(betraege)
-        return {"betrag": max_betrag, "original": format_betrag(max_betrag), "typ": "max"}
+    # 4. Wenn "Netto" gefunden → berechne Brutto (Netto * 1.19)
+    netto_matches = list(re.finditer(r'(?:netto|warenwert)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
+    if netto_matches:
+        netto_betraege = [(m, parse_betrag(m.group(1))) for m in netto_matches if 0 < parse_betrag(m.group(1)) < 50000]
+        if netto_betraege:
+            netto_match, netto_betrag = max(netto_betraege, key=lambda x: x[1])
+            # Berechne Brutto: Netto * 1.19
+            brutto_berechnet = round(netto_betrag * 1.19, 2)
+            
+            # Prüfe ob ein "Gesamtbetrag" nahe am berechneten Brutto liegt
+            for betrag, prio, orig, typ in alle_kandidaten[:]:
+                if abs(betrag - brutto_berechnet) < 0.5:  # Toleranz 50 Cent
+                    # Das ist vermutlich der Brutto-Betrag - booste Prio
+                    alle_kandidaten.remove((betrag, prio, orig, typ))
+                    alle_kandidaten.append((betrag, 95, orig, "brutto_verifiziert"))
+    
+    # 5. Fallback: Höchster Betrag in der ganzen Rechnung (untere Grenze)
+    all_betraege = []
+    for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', text):
+        b = parse_betrag(m.group(1))
+        if 0 < b < 50000:
+            all_betraege.append(b)
+    if all_betraege:
+        max_betrag = max(all_betraege)
+        # Nur als Fallback wenn nichts besseres gefunden
+        if not any(prio >= 80 for betrag, prio, orig, typ in alle_kandidaten):
+            alle_kandidaten.append((max_betrag, 10, format_betrag(max_betrag), "max"))
+    
+    # Wähle den besten Kandidaten (höchste Prio, bei Gleichstand höchster Betrag)
+    if alle_kandidaten:
+        # Sortiere nach Prio (absteigend), dann nach Betrag (absteigend)
+        alle_kandidaten.sort(key=lambda x: (x[1], x[0]), reverse=True)
+        best_betrag, best_prio, best_orig, best_typ = alle_kandidaten[0]
+        return {"betrag": best_betrag, "original": best_orig, "typ": best_typ}
     
     return None
 
