@@ -273,40 +273,75 @@ def finde_gesamtpreis(text):
 
 
 def finde_datum(text):
-    """Extrahiert das Rechnungsdatum"""
-    # Zuerst: Suche nach explizitem "Rechnungsdatum"
-    rechnungs_datum_muster = re.compile(r'rechnungsdatum[\s:]+(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})', re.IGNORECASE)
-    match = re.search(rechnungs_datum_muster, text)
-    if match:
-        tag = int(match.group(1))
-        monat = int(match.group(2))
-        jahr = int(match.group(3))
-        if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
-            return {"tag": tag, "monat": monat, "jahr": jahr, "iso": f"{jahr}-{monat:02d}-{tag:02d}"}
+    """Extrahiert das Rechnungsdatum - verbesserte Version"""
+    text_lower = text.lower()
     
-    # Alternative: Suche nach "Datum" oder "Rechnung" + Datum
-    datum_mit_kontext = re.compile(r'(?:datum|rechnung|invoice)[\s\S]{0,30}(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})', re.IGNORECASE)
-    for match in datum_mit_kontext.finditer(text):
-        tag = int(match.group(1))
-        monat = int(match.group(2))
-        jahr = int(match.group(3))
-        if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
-            context_before = text[max(0, match.start() - 50):match.start()].lower()
-            if not re.search(r'verbrauch|zeitraum|von|bis|abrechnung', context_before, re.IGNORECASE):
+    # 1. HÖCHSTE Priorität: Explizites "Rechnungsdatum" oder "Rechnung ... Datum"
+    # Muster: "Rechnungsdatum: 21.04.2026" oder "Rechnung Nr. ... Datum: 21.04.2026"
+    rechnungs_patterns = [
+        r'ReCHNUNGSDATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
+        r'ReCHNUNG[^\n]{0,100}DATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
+        r'DATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})[^\n]{0,50}RECHNUNG',
+    ]
+    
+    for pattern in rechnungs_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            tag = int(match.group(1))
+            monat = int(match.group(2))
+            jahr = int(match.group(3))
+            if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
                 return {"tag": tag, "monat": monat, "jahr": jahr, "iso": f"{jahr}-{monat:02d}-{tag:02d}"}
     
-    # Fallback: Alle Datumsangaben sammeln
-    muster = re.compile(r'(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})')
-    daten = []
+    # 2. Suche nach "Datum" in Verbindung mit "Rechnung" in der Nähe
+    # Prüfe alle "Datum" Vorkommen
+    datum_matches = list(re.finditer(r'(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})', text))
+    beste_kandidaten = []
     
-    for match in muster.finditer(text):
+    for match in datum_matches:
         tag = int(match.group(1))
         monat = int(match.group(2))
         jahr = int(match.group(3))
         
-        if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
-            context = text[max(0, match.start() - 80):match.end() + 80].lower()
-            ist_verbrauch = re.search(r'verbrauch|zeitraum|von.*bis|abrechnungszeitraum', context, re.IGNORECASE)
+        if not (1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030):
+            continue
+        
+        # Kontext um das Datum prüfen
+        context_start = max(0, match.start() - 100)
+        context_end = min(len(text), match.end() + 100)
+        context = text[context_start:context_end].lower()
+        
+        # Prio basierend auf Kontext
+        prio = 0
+        if 'rechnungsdatum' in context:
+            prio = 100
+        elif 'rechnung' in context and 'datum' in context:
+            prio = 90
+        elif 'rechnung' in context:
+            prio = 80
+        elif 'datum' in context:
+            prio = 70
+        else:
+            prio = 10  # Fallback
+        
+        # Reduziere Prio bei Verbrauchs-/Zeitraum-Kontext
+        if re.search(r'verbrauch|zeitraum|von.*bis|abrechnungszeitraum|lieferzeitraum', context):
+            prio -= 50
+        
+        # Reduziere Prio bei "Auftragsdatum", "Lieferscheindatum", etc.
+        if re.search(r'auftragsdatum|lieferscheindatum|versanddatum|bestelldatum', context):
+            prio -= 30
+        
+        if prio > 0:
+            beste_kandidaten.append((prio, jahr, monat, tag, f"{jahr}-{monat:02d}-{tag:02d}"))
+    
+    # Wähle den besten Kandidaten (höchste Prio)
+    if beste_kandidaten:
+        beste_kandidaten.sort(reverse=True)
+        _, jahr, monat, tag, iso = beste_kandidaten[0]
+        return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
+    
+    return None
             ist_rechnung = re.search(r'rechnung|rechnungsdatum|fällig|zahlbar', context, re.IGNORECASE)
             
             gewicht = 3 if ist_rechnung else (0 if ist_verbrauch else 1)
