@@ -20,10 +20,19 @@ import re
 import sys
 import tempfile
 import subprocess
+import json
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
 from collections import defaultdict
+
+try:
+    import requests
+    REQUESTS_VERFUEGBAR = True
+except ImportError:
+    REQUESTS_VERFUEGBAR = False
+    print("⚠️  requests nicht installiert. Online-OCR deaktiviert.")
+    print("   Installieren mit: pip install requests")
 
 try:
     import pdfplumber
@@ -52,7 +61,8 @@ except ImportError:
 CONFIG = {
     "start_nummer": 1,
     "prefix": "26-",
-    "excel_datei": "Rechnungsuebersicht.xlsx"
+    "excel_datei": "Rechnungsuebersicht.xlsx",
+    "ocr_space_api_key": "K83767756488957"  # Free OCR API Key
 }
 
 # Bekannte Lieferanten mit korrekten Umlauten - SPEZIFISCHE zuerst!
@@ -345,6 +355,67 @@ def finde_datum(text):
     return None
 
 
+def ocr_pdf_online(datei_pfad):
+    """Verwendet OCR.space API für gescannte PDFs (kostenlos)"""
+    if not REQUESTS_VERFUEGBAR:
+        return None
+    
+    api_key = CONFIG.get("ocr_space_api_key", "")
+    if not api_key:
+        return None
+    
+    try:
+        print("  🌐 Versuche Online-OCR (OCR.space)...")
+        
+        # API Endpoint
+        url = "https://api.ocr.space/parse/image"
+        
+        # Datei hochladen
+        with open(datei_pfad, 'rb') as f:
+            response = requests.post(
+                url,
+                files={"file": (os.path.basename(datei_pfad), f)},
+                data={
+                    "apikey": api_key,
+                    "language": "ger",
+                    "OCREngine": "2",  # Bessere Erkennung
+                    "isTable": "false",
+                    "detectOrientation": "true",
+                    "scale": "true"
+                },
+                timeout=60
+            )
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            if result.get("OCRExitCode") == 1:
+                parsed_text = ""
+                for parsed_result in result.get("ParsedResults", []):
+                    parsed_text += parsed_result.get("ParsedText", "") + "\n"
+                
+                if parsed_text.strip():
+                    print("  ✅ Online-OCR erfolgreich")
+                    return parsed_text
+                else:
+                    print("  ⚠️  Online-OCR: Kein Text erkannt")
+                    return None
+            else:
+                error_msg = result.get("ErrorMessage", ["Unbekannter Fehler"])[0]
+                print(f"  ⚠️  Online-OCR Fehler: {error_msg}")
+                return None
+        else:
+            print(f"  ⚠️  Online-OCR HTTP Fehler: {response.status_code}")
+            return None
+            
+    except requests.exceptions.Timeout:
+        print("  ⚠️  Online-OCR Timeout (60s)")
+        return None
+    except Exception as e:
+        print(f"  ⚠️  Online-OCR Fehler: {e}")
+        return None
+
+
 def ocr_pdf(datei_pfad):
     """Versucht OCR auf gescanntem PDF durchzuführen"""
     if not OCR_VERFUEGBAR:
@@ -385,28 +456,38 @@ def verarbeite_pdf(datei_pfad):
         if len(text.strip()) < 100:
             ist_gescannt = True
             print("  📄 Wenig Text gefunden, versuche OCR...")
+            
+            # 1. Versuche lokales OCR (Tesseract)
             ocr_text = ocr_pdf(datei_pfad)
             if ocr_text:
                 text = ocr_text
                 ist_gescannt = False  # OCR hat funktioniert
-                print("  ✅ OCR erfolgreich")
+                print("  ✅ Lokales OCR erfolgreich (Tesseract)")
             else:
-                if OCR_VERFUEGBAR:
-                    return {
-                        "datei": os.path.basename(datei_pfad),
-                        "pfad": datei_pfad,
-                        "gescannt": True,
-                        "extrahiert": False,
-                        "hinweis": "Gescanntes PDF - OCR fehlgeschlagen (Tesseract installiert?)"
-                    }
+                # 2. Versuche Online-OCR (OCR.space)
+                ocr_text = ocr_pdf_online(datei_pfad)
+                if ocr_text:
+                    text = ocr_text
+                    ist_gescannt = True  # Online-OCR war nötig
+                    print("  ✅ Online-OCR erfolgreich (OCR.space)")
                 else:
-                    return {
-                        "datei": os.path.basename(datei_pfad),
-                        "pfad": datei_pfad,
-                        "gescannt": True,
-                        "extrahiert": False,
-                        "hinweis": "Gescanntes PDF - OCR nicht verfügbar (pip install pdf2image pytesseract)"
-                    }
+                    # Beide OCR-Methoden fehlgeschlagen
+                    if OCR_VERFUEGBAR or REQUESTS_VERFUEGBAR:
+                        return {
+                            "datei": os.path.basename(datei_pfad),
+                            "pfad": datei_pfad,
+                            "gescannt": True,
+                            "extrahiert": False,
+                            "hinweis": "Gescanntes PDF - OCR fehlgeschlagen (lokal und online)"
+                        }
+                    else:
+                        return {
+                            "datei": os.path.basename(datei_pfad),
+                            "pfad": datei_pfad,
+                            "gescannt": True,
+                            "extrahiert": False,
+                            "hinweis": "Gescanntes PDF - keine OCR verfügbar (lokal: pip install pdf2image pytesseract | online: pip install requests)"
+                        }
         
         # Extrahiere alle Daten
         lieferant = finde_lieferant(text)
