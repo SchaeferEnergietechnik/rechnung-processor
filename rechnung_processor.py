@@ -342,24 +342,6 @@ def finde_datum(text):
         return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
     
     return None
-            ist_rechnung = re.search(r'rechnung|rechnungsdatum|fällig|zahlbar', context, re.IGNORECASE)
-            
-            gewicht = 3 if ist_rechnung else (0 if ist_verbrauch else 1)
-            if gewicht > 0:
-                daten.append({"tag": tag, "monat": monat, "jahr": jahr, "gewicht": gewicht})
-    
-    if not daten:
-        return None
-    
-    # Sortiere nach Gewicht
-    zaehler = {}
-    for d in daten:
-        key = f"{d['jahr']}-{d['monat']:02d}-{d['tag']:02d}"
-        zaehler[key] = zaehler.get(key, 0) + d['gewicht']
-    
-    haeufigstes = max(zaehler.items(), key=lambda x: x[1])[0]
-    jahr, monat, tag = map(int, haeufigstes.split('-'))
-    return {"tag": tag, "monat": monat, "jahr": jahr, "iso": haeufigstes}
 
 
 def ocr_pdf(datei_pfad):
