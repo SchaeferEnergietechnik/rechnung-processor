@@ -32,7 +32,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from openpyxl import Workbook
+    from openpyxl import Workbook, load_workbook
     from openpyxl.styles import Font, PatternFill
 except ImportError:
     print("Fehler: openpyxl nicht installiert.")
@@ -358,8 +358,70 @@ def generiere_dateiname(daten, nummer):
     return f"{nummer_str}_{datum_str}_{lieferant_safe}_{preis_str}EUR.pdf"
 
 
-def erstelle_excel(ergebnisse, ziel_pfad):
-    """Erstellt die Excel-Datei"""
+def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
+    """Aktualisiert oder erstellt die Excel-Datei mit fortlaufender Liste"""
+    
+    # Lade bestehende Excel wenn vorhanden
+    bestehende_eintraege = []
+    if os.path.exists(ziel_pfad):
+        try:
+            wb_alt = load_workbook(ziel_pfad)
+            ws_alt = wb_alt["Rechnungen"]
+            
+            # Lese bestehende Einträge (ab Zeile 2, da Zeile 1 = Header)
+            for row in ws_alt.iter_rows(min_row=2, values_only=True):
+                if row[0] and row[1] and row[2]:  # Lfd. Nr., Datum, Lieferant
+                    bestehende_eintraege.append({
+                        "lfd_nr": row[0],
+                        "datum": row[1],
+                        "lieferant": row[2],
+                        "gesamtpreis": row[3],
+                        "seiten": row[4],
+                        "ocr": row[5],
+                        "original": row[6]
+                    })
+            print(f"📊 {len(bestehende_eintraege)} bestehende Einträge geladen")
+        except Exception as e:
+            print(f"⚠️  Konnte bestehende Excel nicht laden: {e}")
+    
+    # Sammle neue erfolgreiche Einträge
+    neue_erfolgreiche = [e for e in ergebnisse if e["extrahiert"]]
+    
+    # Finde höchste vorhandene Nummer
+    max_nummer = 0
+    for eintrag in bestehende_eintraege:
+        try:
+            nummer = int(str(eintrag["lfd_nr"]).replace(CONFIG["prefix"], ""))
+            max_nummer = max(max_nummer, nummer)
+        except:
+            pass
+    
+    # Erstelle neue Einträge mit fortlaufender Nummerierung
+    neue_eintraege = []
+    for idx, e in enumerate(neue_erfolgreiche, max_nummer + 1):
+        neue_eintraege.append({
+            "lfd_nr": f"{CONFIG['prefix']}{idx:03d}",
+            "datum": e["datum"]["iso"] if e["datum"] else "-",
+            "lieferant": e["lieferant"],
+            "gesamtpreis": format_betrag(e["gesamtpreis"]),
+            "seiten": e["seiten"],
+            "ocr": "Ja" if e.get("ocr_verwendet") else "Nein",
+            "original": e["datei"]
+        })
+    
+    # Alle Einträge kombinieren
+    alle_eintraege = bestehende_eintraege + neue_eintraege
+    
+    # Sortiere nach Datum (neueste zuerst)
+    def sort_key(e):
+        try:
+            return e["datum"] if e["datum"] != "-" else "0000-00-00"
+        except:
+            return "0000-00-00"
+    
+    alle_eintraege.sort(key=sort_key, reverse=True)
+    
+    # Erstelle neues Workbook
     wb = Workbook()
     
     # Haupt-Tabelle
@@ -373,17 +435,16 @@ def erstelle_excel(ergebnisse, ziel_pfad):
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
     
-    # Daten
-    erfolgreiche = [e for e in ergebnisse if e["extrahiert"]]
-    for idx, e in enumerate(erfolgreiche, 1):
+    # Alle Daten schreiben
+    for idx, e in enumerate(alle_eintraege, 1):
         row = idx + 1
-        ws_haupt.cell(row=row, column=1, value=f"{CONFIG['prefix']}{idx:03d}")
-        ws_haupt.cell(row=row, column=2, value=e["datum"]["iso"] if e["datum"] else "-")
+        ws_haupt.cell(row=row, column=1, value=e["lfd_nr"])
+        ws_haupt.cell(row=row, column=2, value=e["datum"])
         ws_haupt.cell(row=row, column=3, value=e["lieferant"])
-        ws_haupt.cell(row=row, column=4, value=format_betrag(e["gesamtpreis"]))
+        ws_haupt.cell(row=row, column=4, value=e["gesamtpreis"])
         ws_haupt.cell(row=row, column=5, value=e["seiten"])
-        ws_haupt.cell(row=row, column=6, value="Ja" if e.get("ocr_verwendet") else "Nein")
-        ws_haupt.cell(row=row, column=7, value=e["datei"])
+        ws_haupt.cell(row=row, column=6, value=e["ocr"])
+        ws_haupt.cell(row=row, column=7, value=e["original"])
     
     # Spaltenbreiten anpassen
     ws_haupt.column_dimensions['A'].width = 12
@@ -394,21 +455,31 @@ def erstelle_excel(ergebnisse, ziel_pfad):
     ws_haupt.column_dimensions['F'].width = 15
     ws_haupt.column_dimensions['G'].width = 40
     
-    # Monatsauswertung
+    # Monatsauswertung (aus allen Einträgen)
     ws_monat = wb.create_sheet("Monatsauswertung")
     monats_daten = {}
-    for e in erfolgreiche:
-        if e["datum"]:
-            key = f"{e['datum']['jahr']}-{e['datum']['monat']:02d}"
-            if key not in monats_daten:
-                monats_daten[key] = {
-                    "jahr": e["datum"]["jahr"],
-                    "monat": e["datum"]["monat"],
-                    "anzahl": 0,
-                    "summe": 0.0
-                }
-            monats_daten[key]["anzahl"] += 1
-            monats_daten[key]["summe"] += e["gesamtpreis"]
+    
+    for e in alle_eintraege:
+        if e["datum"] and e["datum"] != "-":
+            try:
+                datum_parts = e["datum"].split("-")
+                jahr = int(datum_parts[0])
+                monat = int(datum_parts[1])
+                key = f"{jahr}-{monat:02d}"
+                
+                if key not in monats_daten:
+                    monats_daten[key] = {
+                        "jahr": jahr,
+                        "monat": monat,
+                        "anzahl": 0,
+                        "summe": 0.0
+                    }
+                monats_daten[key]["anzahl"] += 1
+                # Parse Betrag (Deutsch: 1.234,56 → 1234.56)
+                betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
+                monats_daten[key]["summe"] += float(betrag_str)
+            except:
+                pass
     
     # Header Monat
     for col, header in enumerate(["Jahr", "Monat", "Monatsname", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
@@ -428,12 +499,18 @@ def erstelle_excel(ergebnisse, ziel_pfad):
     # Jahresauswertung
     ws_jahr = wb.create_sheet("Jahresauswertung")
     jahres_daten = {}
-    for e in erfolgreiche:
-        jahr = e["datum"]["jahr"] if e["datum"] else datetime.now().year
-        if jahr not in jahres_daten:
-            jahres_daten[jahr] = {"jahr": jahr, "anzahl": 0, "summe": 0.0}
-        jahres_daten[jahr]["anzahl"] += 1
-        jahres_daten[jahr]["summe"] += e["gesamtpreis"]
+    
+    for e in alle_eintraege:
+        if e["datum"] and e["datum"] != "-":
+            try:
+                jahr = int(e["datum"].split("-")[0])
+                if jahr not in jahres_daten:
+                    jahres_daten[jahr] = {"jahr": jahr, "anzahl": 0, "summe": 0.0}
+                jahres_daten[jahr]["anzahl"] += 1
+                betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
+                jahres_daten[jahr]["summe"] += float(betrag_str)
+            except:
+                pass
     
     # Header Jahr
     for col, header in enumerate(["Jahr", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
@@ -448,6 +525,8 @@ def erstelle_excel(ergebnisse, ziel_pfad):
         ws_jahr.cell(row=idx + 1, column=3, value=format_betrag(j["summe"]))
     
     wb.save(ziel_pfad)
+    
+    return len(neue_eintraege), len(alle_eintraege)  # Neue, Gesamt
 
 
 def main():
@@ -512,7 +591,7 @@ def main():
     
     # Excel erstellen
     excel_pfad = os.path.join(quell_ordner, CONFIG["excel_datei"])
-    erstelle_excel(ergebnisse, excel_pfad)
+    neue_eintraege, gesamt_eintraege = erstelle_excel(ergebnisse, excel_pfad, quell_ordner)
     
     # Zusammenfassung
     erfolgreich = len([e for e in ergebnisse if e["extrahiert"]])
@@ -520,10 +599,12 @@ def main():
     gesamt_summe = sum(e["gesamtpreis"] for e in ergebnisse if e["extrahiert"])
     
     print("\n📊 Zusammenfassung:")
-    print(f"   Erfolgreich verarbeitet: {erfolgreich}")
+    print(f"   Neue Rechnungen: {erfolgreich}")
     print(f"   Fehler: {fehler}")
-    print(f"   Gesamtsumme: {format_betrag(gesamt_summe)} € (Brutto)")
-    print(f"\n📂 Excel erstellt: {CONFIG['excel_datei']}")
+    print(f"   Gesamtsumme (neu): {format_betrag(gesamt_summe)} €")
+    print(f"\n📂 Excel aktualisiert: {CONFIG['excel_datei']}")
+    print(f"   {neue_eintraege} neue Einträge hinzugefügt")
+    print(f"   {gesamt_eintraege} Einträge insgesamt")
     
     # Warte auf Tastendruck
     print("\n-------------------------------------------")
