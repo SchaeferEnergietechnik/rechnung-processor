@@ -139,61 +139,77 @@ def bereinige_lieferant(name):
 
 
 def finde_gesamtpreis(text):
-    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt)"""
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version"""
+    text_lower = text.lower()
     
-    # 1. Suche explizit nach BRUTTO-Beträgen
-    brutto_muster = [
-        # "Gesamtbetrag brutto" oder "Rechnungsbetrag brutto"
-        r'(?:gesamtbetrag|rechnungsbetrag|endbetrag|summe)[\s\w]{0,20}(?:brutto|inkl\.?\s*MwSt|inklusive\s*MwSt)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        # "brutto" gefolgt von Betrag in derselben Zeile
-        r'brutto[:\s]+[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        # "zu zahlen" oder "fällig" mit Betrag
-        r'(?:zu\s*zahlen|fällig|zahlbar|betrag)[\s\w]{0,30}(?:brutto)?[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+    # 1. HÖCHSTE Priorität: "Summe Bruttowert" (Voelkner-Style)
+    match = re.search(r'summe\s+bruttowert[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
+    if match:
+        betrag = parse_betrag(match.group(1))
+        if 0 < betrag < 50000:
+            return {"betrag": betrag, "original": match.group(1), "typ": "brutto_explicit"}
+    
+    # 2. "Gesamtbetrag" gefolgt von Betrag (mehrere Varianten)
+    gesamt_patterns = [
+        r'gesamtbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        r'gesamtbetrag[:\s]*\n?\s*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        r'endbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        r'rechnungsbetrag(?:\s+brutto)?[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
     ]
-    
-    for muster in brutto_muster:
-        match = re.search(muster, text, re.IGNORECASE)
+    for pattern in gesamt_patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if match:
             betrag = parse_betrag(match.group(1))
             if 0 < betrag < 50000:
-                return {"betrag": betrag, "original": match.group(1), "typ": "brutto"}
+                return {"betrag": betrag, "original": match.group(1), "typ": "gesamtbetrag"}
     
-    # 2. Suche nach "Netto" - dann nächsten höheren Betrag als Brutto
-    netto_match = re.search(r'netto[:\s]+[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
-    if netto_match:
-        netto_betrag = parse_betrag(netto_match.group(1))
-        # Suche alle Beträge nach dem Netto
-        position_nach_netto = text[netto_match.end():]
-        betraege_nach_netto = []
-        for match in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', position_nach_netto[:500]):
-            b = parse_betrag(match.group(1))
-            if netto_betrag * 0.9 < b < netto_betrag * 1.3:  # Ungefähr gleiche Größenordnung
-                betraege_nach_netto.append(b)
-        if betraege_nach_netto:
-            brutto = max(betraege_nach_netto)
-            return {"betrag": brutto, "original": format_betrag(brutto), "typ": "berechnet_brutto"}
+    # 3. "zu zahlen" / "fällig" / "zahlbar" mit höherem Betrag
+    zahlbar_matches = list(re.finditer(r'(?:zu\s*zahlen|fällig|zahlbar|noch\s*zu\s*zahlend)[^\d]{0,100}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
+    if zahlbar_matches:
+        # Nimm den höchsten "zu zahlen" Betrag (das ist meist Brutto)
+        betraege = [(m, parse_betrag(m.group(1))) for m in zahlbar_matches if 0 < parse_betrag(m.group(1)) < 50000]
+        if betraege:
+            best_match = max(betraege, key=lambda x: x[1])
+            return {"betrag": best_match[1], "original": best_match[0].group(1), "typ": "zuzahlen"}
     
-    # 3. Fallback: Suche nach Schlüsselwörtern ohne "brutto"
-    fallback_muster = [
-        r'(?:rechnungsbetrag|zu\s*zahlen|fällig|noch\s*zu\s*zahlend)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'(?:gesamtbetrag|endbetrag)[^\d]{0,50}(?:brutto)?[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'(?:zahlbar|betrag)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-    ]
+    # 4. Wenn "Netto" gefunden wird → suche höheren Betrag danach
+    netto_matches = list(re.finditer(r'(?:netto|gesamt\s*netto|warenwert)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
+    if netto_matches:
+        netto_values = [(m, parse_betrag(m.group(1))) for m in netto_matches if 0 < parse_betrag(m.group(1)) < 50000]
+        if netto_values:
+            netto_match, netto_betrag = max(netto_values, key=lambda x: x[1])
+            
+            # Suche nach höherem Betrag im Kontext danach
+            context_nach = text[netto_match.end():netto_match.end()+800]
+            brutto_candidates = []
+            for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', context_nach):
+                b = parse_betrag(m.group(1))
+                # Brutto ist typischerweise 10-30% höher als Netto
+                if netto_betrag * 1.1 < b < netto_betrag * 1.5:
+                    brutto_candidates.append(b)
+            
+            if brutto_candidates:
+                brutto = max(brutto_candidates)
+                return {"betrag": brutto, "original": format_betrag(brutto), "typ": "berechnet_brutto"}
+            else:
+                # Fallback: Suche höchsten Betrag in ganzer Rechnung
+                all_betraege = []
+                for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', text):
+                    b = parse_betrag(m.group(1))
+                    if 0 < b < 50000:
+                        all_betraege.append(b)
+                if all_betraege:
+                    max_betrag = max(all_betraege)
+                    if max_betrag > netto_betrag:
+                        return {"betrag": max_betrag, "original": format_betrag(max_betrag), "typ": "max_vs_netto"}
     
-    for muster in fallback_muster:
-        match = re.search(muster, text, re.IGNORECASE)
-        if match:
-            betrag = parse_betrag(match.group(1))
-            if 0 < betrag < 50000:
-                return {"betrag": betrag, "original": match.group(1), "typ": "fallback"}
-    
-    # 4. Letzter Fallback: Höchster realistischer Betrag
+    # 5. Fallback: Höchster realistischer Betrag
     betrag_muster = re.compile(r'(\d{1,3}(?:\.\d{3})*,\d{2})')
     betraege = []
     
     for match in betrag_muster.finditer(text):
         betrag = parse_betrag(match.group(1))
-        if 0 < betrag < 10000:
+        if 0 < betrag < 50000:
             betraege.append(betrag)
     
     if betraege:
