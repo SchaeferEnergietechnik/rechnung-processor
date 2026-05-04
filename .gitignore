@@ -1,0 +1,24 @@
+# Abhängigkeiten
+node_modules/
+__pycache__/
+*.pyc
+
+# Build-Ausgaben
+build/
+dist/
+*.spec
+
+# Temporäre Dateien
+*.log
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test-Rechnungen
+*.pdf
+!test-rechnungen/.gitkeep
