@@ -69,10 +69,12 @@ LIEFERANTEN_MAP = {
     'invent': 'RE-INvent',
 }
 
-# Stoppwörter
+# Stoppwörter - ERWEITERT
 STOPP_WORTER = ['umsatzsteuer', 'ust-id', 'steuernummer', 'bankverbindung', 'bic', 'iban', 
     'öffnungszeiten', 'montag', 'dienstag', 'mittwoch', 'donnerstag', 'freitag', 
-    'strasse', 'ferchlipp', 'lichterfelde', 'altmärkische', 'deutschland', 'g.e.s.', 'energietechnik']
+    'strasse', 'ferchlipp', 'lichterfelde', 'altmärkische', 'deutschland', 'g.e.s.', 'energietechnik',
+    'gesamtbetrag', 'rechnungsbetrag', 'endbetrag', 'brutto', 'netto', 'zzgl', 'zuzüglich',
+    'abzüglich', 'abschlag', 'zahlung', 'betrag', 'summe', 'bruttowert', 'nettowert']
 
 
 def parse_betrag(betrag_str):
@@ -93,71 +95,85 @@ def format_betrag(betrag):
 
 
 def finde_lieferant(text):
-    """Extrahiert den Lieferanten aus dem Text - verbesserte Version"""
+    """Extrahiert den Lieferanten aus dem Text - verbesserte Version v3"""
     text_lower = text.lower()
-    
-    # PRÜFE: Ist G.E.S. der Empfänger (Lieferant = jemand anderes)?
-    # Suche nach Mustern wie "Rechnung [Lieferant]" oder Lieferant über Empfänger
     lines = text.split('\n')
     
-    # 1. Suche explizit nach "Rechnung" + Firma (Lieferanten)
-    # Muster: "Rechnung\nFirma GmbH" oder "Rechnung Firma GmbH"
+    # HARTE REGEL: Bekannte Lieferanten direkt erkennen (Case-sensitive Teile)
+    if 'stadtwerke wittenberge gmbh' in text_lower:
+        return 'Stadtwerke_Wittenberge'
+    if 'böttcher ag' in text_lower:
+        return 'Böttcher'
+    if 'bottcher ag' in text_lower:
+        return 'Böttcher'
+    if 're-invent retail' in text_lower or 're-invent' in text_lower:
+        return 'RE-INvent_Retail'
+    if 'voelkner' in text_lower:
+        return 'Voelkner'
+    if 'steinke' in text_lower:
+        return 'Steinke'
+    
+    # Suche nach explizitem "Rechnung" + Firma
     rechnung_pattern = re.search(r'ReCHNUNG\s*\n?\s*([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', text, re.IGNORECASE)
     if rechnung_pattern:
         kandidat = rechnung_pattern.group(1).strip()
-        if 'G.E.S.' not in kandidat and 'Energietechnik' not in kandidat:
+        if ist_gueltiger_lieferant(kandidat):
             return bereinige_lieferant(kandidat)
     
-    # 2. Prüfe bekannte Lieferanten in Reihenfolge (spezifische zuerst)
-    for key, value in LIEFERANTEN_MAP.items():
-        if key.lower() in text_lower:
-            # Prüfe dass es nicht G.E.S. selbst ist
-            if 'G.E.S.' not in value and 'Energietechnik' not in value:
-                return value
+    # Suche nach Firmen die G.E.S. beliefert (Firma vor oder nach G.E.S.)
+    # Muster: Firma GmbH ... G.E.S. Energietechnik
+    ges_pattern = re.search(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))[^.]{0,200}G\.E\.S', text, re.IGNORECASE | re.DOTALL)
+    if ges_pattern:
+        kandidat = ges_pattern.group(1).strip()
+        if ist_gueltiger_lieferant(kandidat):
+            return bereinige_lieferant(kandidat)
     
-    # 3. Suche nach Firma die G.E.S. beliefert (nicht G.E.S. selbst)
-    # Suche Abschnitte mit "Rechnung" und dann Firmenname
-    rechnung_sections = re.split(r'ReCHNUNG', text, flags=re.IGNORECASE)
-    if len(rechnung_sections) > 1:
-        # Nimm den Teil nach "Rechnung"
-        after_rechnung = rechnung_sections[1][:500]  # Erste 500 Zeichen
-        firmen = re.findall(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', after_rechnung)
-        for firma in firmen:
-            firma_clean = firma.strip()
-            if len(firma_clean) > 5 and 'G.E.S' not in firma_clean and 'Energietechnik' not in firma_clean:
-                if not any(stop in firma_clean.lower() for stop in STOPP_WORTER):
-                    return bereinige_lieferant(firma_clean)
-    
-    # 4. Suche nach Absender (nicht Empfänger)
-    # Muster: Absender oben, Empfänger mit "Herrn" oder Adresse unten
-    absender_section = '\n'.join(lines[:10])  # Erste 10 Zeilen = meist Absender
+    # Erste 10 Zeilen = meist Absender
+    absender_section = '\n'.join(lines[:10])
     firmen_absender = re.findall(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', absender_section)
     for firma in firmen_absender:
         firma_clean = firma.strip()
-        if len(firma_clean) > 5 and 'G.E.S' not in firma_clean and 'Energietechnik' not in firma_clean:
-            if not any(stop in firma_clean.lower() for stop in STOPP_WORTER):
-                return bereinige_lieferant(firma_clean)
+        if ist_gueltiger_lieferant(firma_clean):
+            return bereinige_lieferant(firma_clean)
     
-    # 5. Fallback: Erste Zeilen durchgehen
+    # Fallback: Erste Zeilen durchgehen
     for zeile in lines[:15]:
         if re.search(r'\b(GmbH|AG|KG|OHG|e\.?K|UG)\b', zeile, re.IGNORECASE):
             bereinigt = bereinige_lieferant(zeile)
-            if len(bereinigt) > 3 and 'G.E.S' not in bereinigt:
-                zeile_lower = zeile.lower()
-                if not any(wort in zeile_lower for wort in STOPP_WORTER):
-                    return bereinigt
+            if ist_gueltiger_lieferant(bereinigt):
+                return bereinigt
     
     return 'Unbekannt'
 
 
+def ist_gueltiger_lieferant(name):
+    """Prüft ob ein Name ein gültiger Lieferant ist (kein Stoppwort)"""
+    if len(name) < 5:
+        return False
+    name_lower = name.lower()
+    # Prüfe Stoppwörter
+    for stop in STOPP_WORTER:
+        if stop in name_lower:
+            return False
+    # Prüfe dass es keine reinen Betragsbezeichnungen sind
+    if re.match(r'^(gesamt|rechnungs|end|brutto|netto|summe)', name_lower):
+        return False
+    return True
+
+
 def bereinige_lieferant(name):
     """Bereinigt den Lieferantennamen für Dateinamen"""
-    # Fixe häufige OCR-Fehler bei Umlauten
-    fixed = name
-    fixed = re.sub(r'ttcher', 'Böttcher', fixed, flags=re.IGNORECASE)
+    # Entferne Leerzeichen am Anfang/Ende
+    fixed = name.strip()
+    
+    # Fixe häufige OCR-Fehler bei Umlauten (ERST spezifische, DANN generische!)
+    fixed = re.sub(r'ttcher', 'ttcher', fixed, flags=re.IGNORECASE)  # Placeholder
     fixed = re.sub(r'bottcher', 'Böttcher', fixed, flags=re.IGNORECASE)
     fixed = re.sub(r'schaefer', 'Schäfer', fixed, flags=re.IGNORECASE)
-    fixed = fixed.replace('ae', 'ä').replace('oe', 'ö').replace('ue', 'ü').replace('ss', 'ß')
+    
+    # Generische Umlaut-Fixe NUR wenn nicht schon Umlaute vorhanden
+    if 'ä' not in fixed and 'ö' not in fixed and 'ü' not in fixed:
+        fixed = fixed.replace('ae', 'ä').replace('oe', 'ö').replace('ue', 'ü').replace('ss', 'ß')
     
     # Entferne ungültige Zeichen für Dateinamen
     fixed = re.sub(r'[\\/:*?"<>|]', '_', fixed)
