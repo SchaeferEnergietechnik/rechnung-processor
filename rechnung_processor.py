@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
+from collections import defaultdict
 
 try:
     import pdfplumber
@@ -435,17 +436,18 @@ def verarbeite_pdf(datei_pfad):
 
 
 def generiere_dateiname(daten, nummer):
-    """Generiert neuen Dateinamen mit Datum"""
+    """Generiert neuen Dateinamen: 26-001_Lieferant_2026-04-21_Summe.pdf"""
     nummer_str = f"{CONFIG['prefix']}{nummer:03d}"
-    datum_str = daten["datum"]["iso"] if daten["datum"] else "0000-00-00"
     lieferant_safe = daten["lieferant"]
+    datum_str = daten["datum"]["iso"] if daten["datum"] else "0000-00-00"
     preis_str = format_betrag(daten["gesamtpreis"])
     
-    return f"{nummer_str}_{datum_str}_{lieferant_safe}_{preis_str}EUR.pdf"
+    return f"{nummer_str}_{lieferant_safe}_{datum_str}_{preis_str}EUR.pdf"
 
 
 def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
     """Aktualisiert oder erstellt die Excel-Datei mit fortlaufender Liste"""
+    from collections import defaultdict
     
     # Lade bestehende Excel wenn vorhanden
     bestehende_eintraege = []
@@ -459,12 +461,13 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
                 if row[0] and row[1] and row[2]:  # Lfd. Nr., Datum, Lieferant
                     bestehende_eintraege.append({
                         "lfd_nr": row[0],
-                        "datum": row[1],
-                        "lieferant": row[2],
-                        "gesamtpreis": row[3],
-                        "seiten": row[4],
-                        "ocr": row[5],
-                        "original": row[6]
+                        "datum_iso": row[1],  # ISO Format für Sortierung
+                        "datum_de": row[2],    # Deutsch Format
+                        "lieferant": row[3],
+                        "gesamtpreis": row[4],
+                        "seiten": row[5],
+                        "original": row[6],
+                        "neu_name": row[7] if len(row) > 7 else ""
                     })
             print(f"📊 {len(bestehende_eintraege)} bestehende Einträge geladen")
         except Exception as e:
@@ -485,27 +488,50 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
     # Erstelle neue Einträge mit fortlaufender Nummerierung
     neue_eintraege = []
     for idx, e in enumerate(neue_erfolgreiche, max_nummer + 1):
+        lfd_nr = f"{CONFIG['prefix']}{idx:03d}"
+        datum_iso = e["datum"]["iso"] if e["datum"] else "-"
+        # Deutsch Format: DD.MM.YYYY
+        if datum_iso != "-":
+            parts = datum_iso.split("-")
+            datum_de = f"{parts[2]}.{parts[1]}.{parts[0]}"
+        else:
+            datum_de = "-"
+        
+        # Neuer Dateiname für Spalte
+        lieferant_safe = e["lieferant"]
+        preis_str = format_betrag(e["gesamtpreis"])
+        neu_name = f"{lfd_nr}_{lieferant_safe}_{datum_iso}_{preis_str}EUR.pdf"
+        
         neue_eintraege.append({
-            "lfd_nr": f"{CONFIG['prefix']}{idx:03d}",
-            "datum": e["datum"]["iso"] if e["datum"] else "-",
+            "lfd_nr": lfd_nr,
+            "datum_iso": datum_iso,
+            "datum_de": datum_de,
             "lieferant": e["lieferant"],
             "gesamtpreis": format_betrag(e["gesamtpreis"]),
             "seiten": e["seiten"],
-            "ocr": "Ja" if e.get("ocr_verwendet") else "Nein",
-            "original": e["datei"]
+            "original": e["datei"],
+            "neu_name": neu_name
         })
     
     # Alle Einträge kombinieren
     alle_eintraege = bestehende_eintraege + neue_eintraege
     
-    # Sortiere nach Datum (neueste zuerst)
+    # Sortiere nach Datum (älteste zuerst, dann Lfd. Nr. aufsteigend)
     def sort_key(e):
-        try:
-            return e["datum"] if e["datum"] != "-" else "0000-00-00"
-        except:
-            return "0000-00-00"
+        datum = e["datum_iso"] if e["datum_iso"] != "-" else "0000-00-00"
+        lfd = e["lfd_nr"]
+        return (datum, lfd)
     
-    alle_eintraege.sort(key=sort_key, reverse=True)
+    alle_eintraege.sort(key=sort_key)
+    
+    # Gruppiere nach Jahr-Monat für Summen
+    monats_gruppen = defaultdict(list)
+    for e in alle_eintraege:
+        if e["datum_iso"] != "-":
+            key = e["datum_iso"][:7]  # YYYY-MM
+            monats_gruppen[key].append(e)
+        else:
+            monats_gruppen["0000-00"].append(e)
     
     # Erstelle neues Workbook
     wb = Workbook()
@@ -515,104 +541,124 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
     ws_haupt.title = "Rechnungen"
     
     # Header
-    headers = ["Lfd. Nr.", "Rechnungsdatum", "Lieferant", "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", "OCR verwendet", "Ursprünglicher Dateiname"]
+    headers = ["Lfd. Nr.", "Rechnungsdatum (ISO)", "Rechnungsdatum", "Lieferant", 
+               "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", 
+               "Ursprünglicher Dateiname", "Neuer Dateiname"]
     for col, header in enumerate(headers, 1):
         cell = ws_haupt.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
     
-    # Alle Daten schreiben
-    for idx, e in enumerate(alle_eintraege, 1):
-        row = idx + 1
-        ws_haupt.cell(row=row, column=1, value=e["lfd_nr"])
-        ws_haupt.cell(row=row, column=2, value=e["datum"])
-        ws_haupt.cell(row=row, column=3, value=e["lieferant"])
-        ws_haupt.cell(row=row, column=4, value=e["gesamtpreis"])
-        ws_haupt.cell(row=row, column=5, value=e["seiten"])
-        ws_haupt.cell(row=row, column=6, value=e["ocr"])
-        ws_haupt.cell(row=row, column=7, value=e["original"])
+    # Alle Daten schreiben - nach Monat gruppiert mit Summen
+    current_row = 2
+    monats_summen = {}
+    
+    for monat_key in sorted(monats_gruppen.keys()):
+        eintraege = monats_gruppen[monat_key]
+        monats_summe = 0.0
+        
+        for e in eintraege:
+            ws_haupt.cell(row=current_row, column=1, value=e["lfd_nr"])
+            ws_haupt.cell(row=current_row, column=2, value=e["datum_iso"])
+            ws_haupt.cell(row=current_row, column=3, value=e["datum_de"])
+            ws_haupt.cell(row=current_row, column=4, value=e["lieferant"])
+            ws_haupt.cell(row=current_row, column=5, value=e["gesamtpreis"])
+            ws_haupt.cell(row=current_row, column=6, value=e["seiten"])
+            ws_haupt.cell(row=current_row, column=7, value=e["original"])
+            ws_haupt.cell(row=current_row, column=8, value=e["neu_name"])
+            
+            # Summe berechnen
+            try:
+                betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
+                monats_summe += float(betrag_str)
+            except:
+                pass
+            
+            current_row += 1
+        
+        # Monatssumme einfügen
+        monats_name = monat_key
+        if monat_key != "0000-00":
+            parts = monat_key.split("-")
+            monats_name = f"{parts[1]}.{parts[0]}"
+        
+        sum_cell = ws_haupt.cell(row=current_row, column=1, value=f"Summe {monats_name}")
+        sum_cell.font = Font(bold=True)
+        sum_cell.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
+        
+        sum_value = ws_haupt.cell(row=current_row, column=5, value=format_betrag(monats_summe))
+        sum_value.font = Font(bold=True)
+        sum_value.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
+        
+        monats_summen[monat_key] = monats_summe
+        current_row += 1
     
     # Spaltenbreiten anpassen
     ws_haupt.column_dimensions['A'].width = 12
-    ws_haupt.column_dimensions['B'].width = 18
-    ws_haupt.column_dimensions['C'].width = 30
-    ws_haupt.column_dimensions['D'].width = 25
-    ws_haupt.column_dimensions['E'].width = 15
+    ws_haupt.column_dimensions['B'].width = 20  # ISO Datum (hidden später)
+    ws_haupt.column_dimensions['C'].width = 18  # Deutsch
+    ws_haupt.column_dimensions['D'].width = 30
+    ws_haupt.column_dimensions['E'].width = 25
     ws_haupt.column_dimensions['F'].width = 15
-    ws_haupt.column_dimensions['G'].width = 40
+    ws_haupt.column_dimensions['G'].width = 45
+    ws_haupt.column_dimensions['H'].width = 50
     
-    # Monatsauswertung (aus allen Einträgen)
+    # ISO-Spalte verstecken (nur für interne Sortierung)
+    ws_haupt.column_dimensions['B'].hidden = True
+    
+    # Monatsauswertung
     ws_monat = wb.create_sheet("Monatsauswertung")
-    monats_daten = {}
     
-    for e in alle_eintraege:
-        if e["datum"] and e["datum"] != "-":
-            try:
-                datum_parts = e["datum"].split("-")
-                jahr = int(datum_parts[0])
-                monat = int(datum_parts[1])
-                key = f"{jahr}-{monat:02d}"
-                
-                if key not in monats_daten:
-                    monats_daten[key] = {
-                        "jahr": jahr,
-                        "monat": monat,
-                        "anzahl": 0,
-                        "summe": 0.0
-                    }
-                monats_daten[key]["anzahl"] += 1
-                # Parse Betrag (Deutsch: 1.234,56 → 1234.56)
-                betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
-                monats_daten[key]["summe"] += float(betrag_str)
-            except:
-                pass
-    
-    # Header Monat
-    for col, header in enumerate(["Jahr", "Monat", "Monatsname", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
+    for col, header in enumerate(["Jahr-Monat", "Monatsname", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
         cell = ws_monat.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
     
-    # Daten Monat
-    for idx, (key, m) in enumerate(sorted(monats_daten.items()), 1):
-        monatsname = datetime(m["jahr"], m["monat"], 1).strftime("%B")
-        ws_monat.cell(row=idx + 1, column=1, value=m["jahr"])
-        ws_monat.cell(row=idx + 1, column=2, value=m["monat"])
-        ws_monat.cell(row=idx + 1, column=3, value=monatsname)
-        ws_monat.cell(row=idx + 1, column=4, value=m["anzahl"])
-        ws_monat.cell(row=idx + 1, column=5, value=format_betrag(m["summe"]))
+    for idx, (key, summe) in enumerate(sorted(monats_summen.items()), 1):
+        if key != "0000-00":
+            parts = key.split("-")
+            jahr = parts[0]
+            monat = int(parts[1])
+            monatsname = datetime(int(jahr), monat, 1).strftime("%B %Y")
+            anzahl = len(monats_gruppen[key])
+            
+            ws_monat.cell(row=idx + 1, column=1, value=key)
+            ws_monat.cell(row=idx + 1, column=2, value=monatsname)
+            ws_monat.cell(row=idx + 1, column=3, value=anzahl)
+            ws_monat.cell(row=idx + 1, column=4, value=format_betrag(summe))
+    
+    ws_monat.column_dimensions['A'].width = 15
+    ws_monat.column_dimensions['B'].width = 20
+    ws_monat.column_dimensions['C'].width = 20
+    ws_monat.column_dimensions['D'].width = 20
     
     # Jahresauswertung
     ws_jahr = wb.create_sheet("Jahresauswertung")
-    jahres_daten = {}
+    jahres_daten = defaultdict(lambda: {"anzahl": 0, "summe": 0.0})
     
-    for e in alle_eintraege:
-        if e["datum"] and e["datum"] != "-":
-            try:
-                jahr = int(e["datum"].split("-")[0])
-                if jahr not in jahres_daten:
-                    jahres_daten[jahr] = {"jahr": jahr, "anzahl": 0, "summe": 0.0}
-                jahres_daten[jahr]["anzahl"] += 1
-                betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
-                jahres_daten[jahr]["summe"] += float(betrag_str)
-            except:
-                pass
+    for key, summe in monats_summen.items():
+        if key != "0000-00":
+            jahr = key.split("-")[0]
+            jahres_daten[jahr]["anzahl"] += len(monats_gruppen[key])
+            jahres_daten[jahr]["summe"] += summe
     
-    # Header Jahr
     for col, header in enumerate(["Jahr", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
         cell = ws_jahr.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
     
-    # Daten Jahr
-    for idx, (jahr, j) in enumerate(sorted(jahres_daten.items()), 1):
-        ws_jahr.cell(row=idx + 1, column=1, value=j["jahr"])
-        ws_jahr.cell(row=idx + 1, column=2, value=j["anzahl"])
-        ws_jahr.cell(row=idx + 1, column=3, value=format_betrag(j["summe"]))
+    for idx, (jahr, daten) in enumerate(sorted(jahres_daten.items()), 1):
+        ws_jahr.cell(row=idx + 1, column=1, value=jahr)
+        ws_jahr.cell(row=idx + 1, column=2, value=daten["anzahl"])
+        ws_jahr.cell(row=idx + 1, column=3, value=format_betrag(daten["summe"]))
+    
+    ws_jahr.column_dimensions['A'].width = 15
+    ws_jahr.column_dimensions['B'].width = 20
+    ws_jahr.column_dimensions['C'].width = 20
     
     wb.save(ziel_pfad)
     
-    return len(neue_eintraege), len(alle_eintraege)  # Neue, Gesamt
+    return len(neue_eintraege), len(alle_eintraege)
 
 
 def main():
