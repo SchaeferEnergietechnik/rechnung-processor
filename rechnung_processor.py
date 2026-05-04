@@ -74,6 +74,7 @@ LIEFERANTEN_MAP = {
     'ttcher': 'Böttcher',
     'bottcher': 'Böttcher',
     'stadtwerke wittenberge': 'Stadtwerke Wittenberge',
+    'amazon': 'Amazon',
     # Allgemeine Treffer zuletzt
     'stadtwerke': 'Stadtwerke',
     'wittenberge': 'Stadtwerke Wittenberge',
@@ -117,6 +118,23 @@ def finde_lieferant(text):
         return 'Böttcher'
     if 'bottcher ag' in text_lower:
         return 'Böttcher'
+    if 're-invent retail' in text_lower or 're-invent' in text_lower:
+        return 'RE-INvent_Retail'
+    if 'voelkner' in text_lower:
+        return 'Voelkner'
+    if 'steinke' in text_lower:
+        return 'Steinke'
+    if 'ttt-filmserivce' in text_lower or 'filmserivce' in text_lower:
+        return 'TTT-Filmservice'
+    
+    # AMAZON SPEZIAL: Wenn "Amazon" im Text ist, immer Amazon als Lieferant
+    # (egal wer "Verkauft von" ist)
+    if 'amazon eu' in text_lower or 'amazon' in text_lower:
+        # Prüfe ob es wirklich eine Amazon-Rechnung ist
+        if 'bestellnummer' in text_lower or 'amazon.de' in text_lower or 'verkauft von' in text_lower:
+            return 'Amazon'
+    
+    # Suche nach explizitem "Rechnung" + Firma
     if 're-invent retail' in text_lower or 're-invent' in text_lower:
         return 'RE-INvent_Retail'
     if 'voelkner' in text_lower:
@@ -196,22 +214,31 @@ def bereinige_lieferant(name):
 
 
 def finde_gesamtpreis(text):
-    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version v2"""
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version v3"""
     text_lower = text.lower()
     alle_kandidaten = []
     
-    # 0. ERSTE Priorität: "noch zu zahlender Betrag" / "Rechnungsbetrag" (die finale Summe!)
-    zahlungs_patterns = [
+    # 0. HÖCHSTE Priorität: "Summe:" oder "Gesamtpreis" am Ende der Rechnung
+    # Dies ist oft der finale Betrag
+    hoch_prio_patterns = [
+        (r'(?:summe|gesamtpreis|zahlbetrag)[\s:]+(\d{1,3}(?:\.\d{3})*,\d{2})\s*eur', 110),  # "Summe: 24,75 EUR"
+        (r'gesamtpreis\s+(\d{1,3}(?:\.\d{3})*,\d{2})', 110),  # Amazon: "Gesamtpreis 9,47"
         (r'(?:noch\s+zu\s+zahlender\s+betrag|rechnungsbetrag)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 100),
         (r'(?:zu\s*zahlen|fällig)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 90),
         (r'zahlbar[^\d]{0,100}(\d{1,3}(?:\.\d{3})*,\d{2})', 80),
     ]
-    for pattern, prio in zahlungs_patterns:
+    
+    for pattern, prio in hoch_prio_patterns:
         matches = list(re.finditer(pattern, text, re.IGNORECASE))
         for m in matches:
             betrag = parse_betrag(m.group(1))
             if 0 < betrag < 50000:
-                alle_kandidaten.append((betrag, prio, m.group(1), "zahlung"))
+                # Prüfe Kontext - vermeide "Versandkosten", "Aktionsrabatt" etc.
+                context_start = max(0, m.start() - 30)
+                context = text[context_start:m.start()].lower()
+                if any(bad in context for bad in ['versandkosten', 'rabatt', 'discount', 'einzelpreis', 'zwischensumme']):
+                    continue  # Überspringe diese Treffer
+                alle_kandidaten.append((betrag, prio, m.group(1), "endbetrag"))
     
     # 1. "Summe Bruttowert" (Voelkner-Style)
     match = re.search(r'summe\s+bruttowert[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
@@ -220,7 +247,7 @@ def finde_gesamtpreis(text):
         if 0 < betrag < 50000:
             alle_kandidaten.append((betrag, 95, match.group(1), "bruttowert"))
     
-    # 2. "Endbetrag brutto" / "Gesamtbetrag brutto"
+    # 2. "Gesamtbetrag brutto" / "Endbetrag"
     brutto_patterns = [
         r'(?:endbetrag|gesamtbetrag)\s+brutto[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
     ]
@@ -232,10 +259,8 @@ def finde_gesamtpreis(text):
                 alle_kandidaten.append((betrag, 85, m.group(1), "brutto_explicit"))
     
     # 3. Generische "Gesamtbetrag" - sammle ALLE und nimm den HÖCHSTEN
-    # (weil oft: erster = Netto, letzter = Brutto)
     gesamt_matches = list(re.finditer(r'gesamtbetrag[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
     if len(gesamt_matches) > 1:
-        # Mehrere "Gesamtbetrag" gefunden - nimm den HÖCHSTEN (vermutlich Brutto)
         betraege = [(parse_betrag(m.group(1)), m.group(1)) for m in gesamt_matches if 0 < parse_betrag(m.group(1)) < 50000]
         if betraege:
             max_betrag, original = max(betraege, key=lambda x: x[0])
@@ -251,17 +276,14 @@ def finde_gesamtpreis(text):
         netto_betraege = [(m, parse_betrag(m.group(1))) for m in netto_matches if 0 < parse_betrag(m.group(1)) < 50000]
         if netto_betraege:
             netto_match, netto_betrag = max(netto_betraege, key=lambda x: x[1])
-            # Berechne Brutto: Netto * 1.19
             brutto_berechnet = round(netto_betrag * 1.19, 2)
             
-            # Prüfe ob ein "Gesamtbetrag" nahe am berechneten Brutto liegt
             for betrag, prio, orig, typ in alle_kandidaten[:]:
-                if abs(betrag - brutto_berechnet) < 0.5:  # Toleranz 50 Cent
-                    # Das ist vermutlich der Brutto-Betrag - booste Prio
+                if abs(betrag - brutto_berechnet) < 0.5:
                     alle_kandidaten.remove((betrag, prio, orig, typ))
                     alle_kandidaten.append((betrag, 95, orig, "brutto_verifiziert"))
     
-    # 5. Fallback: Höchster Betrag in der ganzen Rechnung (untere Grenze)
+    # 5. Fallback: Höchster Betrag in der ganzen Rechnung
     all_betraege = []
     for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', text):
         b = parse_betrag(m.group(1))
@@ -269,13 +291,11 @@ def finde_gesamtpreis(text):
             all_betraege.append(b)
     if all_betraege:
         max_betrag = max(all_betraege)
-        # Nur als Fallback wenn nichts besseres gefunden
         if not any(prio >= 80 for betrag, prio, orig, typ in alle_kandidaten):
             alle_kandidaten.append((max_betrag, 10, format_betrag(max_betrag), "max"))
     
-    # Wähle den besten Kandidaten (höchste Prio, bei Gleichstand höchster Betrag)
+    # Wähle den besten Kandidaten
     if alle_kandidaten:
-        # Sortiere nach Prio (absteigend), dann nach Betrag (absteigend)
         alle_kandidaten.sort(key=lambda x: (x[1], x[0]), reverse=True)
         best_betrag, best_prio, best_orig, best_typ = alle_kandidaten[0]
         return {"betrag": best_betrag, "original": best_orig, "typ": best_typ}
@@ -364,6 +384,12 @@ def ocr_pdf_online(datei_pfad):
     if not api_key:
         return None
     
+    # Prüfe Dateigröße (max 1MB für Free-Tier)
+    datei_groesse = os.path.getsize(datei_pfad)
+    if datei_groesse > 1024 * 1024:  # 1 MB
+        print(f"  ⚠️  Datei zu groß für Free-OCR ({datei_groesse / 1024 / 1024:.2f} MB > 1 MB)")
+        return None
+    
     try:
         print("  🌐 Versuche Online-OCR (OCR.space)...")
         
@@ -383,7 +409,7 @@ def ocr_pdf_online(datei_pfad):
                     "detectOrientation": "true",
                     "scale": "true"
                 },
-                timeout=60
+                timeout=120  # Erhöht auf 120 Sekunden
             )
         
         if response.status_code == 200:
@@ -409,7 +435,7 @@ def ocr_pdf_online(datei_pfad):
             return None
             
     except requests.exceptions.Timeout:
-        print("  ⚠️  Online-OCR Timeout (60s)")
+        print("  ⚠️  Online-OCR Timeout (120s) - Datei möglicherweise zu groß")
         return None
     except Exception as e:
         print(f"  ⚠️  Online-OCR Fehler: {e}")
