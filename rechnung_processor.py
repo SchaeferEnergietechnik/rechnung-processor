@@ -7,6 +7,7 @@ Rechnungsbearbeitung - PDF-Rechnungen verarbeiten (Python Version)
 Funktionen:
 - Liest PDFs aus dem Ordner, in dem das Script liegt
 - Extrahiert: Gesamtpreis (inkl. MwSt), Lieferant, Rechnungsdatum
+- OCR-Unterstützung für gescannte PDFs (falls Tesseract installiert)
 - Benennt um: 26-xxx_YYYY-MM-DD_Lieferant_Gesamtpreis.pdf
 - Schreibt Excel mit Auswertung
 
@@ -17,8 +18,11 @@ Usage: python rechnung_processor.py
 import os
 import re
 import sys
+import tempfile
+import subprocess
 from pathlib import Path
 from datetime import datetime
+from io import BytesIO
 
 try:
     import pdfplumber
@@ -34,6 +38,14 @@ except ImportError:
     print("Fehler: openpyxl nicht installiert.")
     print("Installieren mit: pip install openpyxl")
     sys.exit(1)
+
+# Optional: OCR-Unterstützung
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_VERFUEGBAR = True
+except ImportError:
+    OCR_VERFUEGBAR = False
 
 # Konfiguration
 CONFIG = {
@@ -127,22 +139,55 @@ def bereinige_lieferant(name):
 
 
 def finde_gesamtpreis(text):
-    """Findet die Endsumme/Gesamtsumme"""
-    muster_prioritaet = [
-        r'(?:rechnungsbetrag|zu zahlen|fällig|noch zu zahlend)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'(?:gesamtbetrag|endbetrag|summe)[^\d]{0,50}(?:brutto)?[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'(?:zahlbar|betrag)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-        r'(?:gesamt|total)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})'
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt)"""
+    
+    # 1. Suche explizit nach BRUTTO-Beträgen
+    brutto_muster = [
+        # "Gesamtbetrag brutto" oder "Rechnungsbetrag brutto"
+        r'(?:gesamtbetrag|rechnungsbetrag|endbetrag|summe)[\s\w]{0,20}(?:brutto|inkl\.?\s*MwSt|inklusive\s*MwSt)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        # "brutto" gefolgt von Betrag in derselben Zeile
+        r'brutto[:\s]+[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        # "zu zahlen" oder "fällig" mit Betrag
+        r'(?:zu\s*zahlen|fällig|zahlbar|betrag)[\s\w]{0,30}(?:brutto)?[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
     ]
     
-    for muster in muster_prioritaet:
+    for muster in brutto_muster:
         match = re.search(muster, text, re.IGNORECASE)
         if match:
             betrag = parse_betrag(match.group(1))
             if 0 < betrag < 50000:
-                return {"betrag": betrag, "original": match.group(1)}
+                return {"betrag": betrag, "original": match.group(1), "typ": "brutto"}
     
-    # Fallback: Höchster realistischer Betrag
+    # 2. Suche nach "Netto" - dann nächsten höheren Betrag als Brutto
+    netto_match = re.search(r'netto[:\s]+[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
+    if netto_match:
+        netto_betrag = parse_betrag(netto_match.group(1))
+        # Suche alle Beträge nach dem Netto
+        position_nach_netto = text[netto_match.end():]
+        betraege_nach_netto = []
+        for match in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', position_nach_netto[:500]):
+            b = parse_betrag(match.group(1))
+            if netto_betrag * 0.9 < b < netto_betrag * 1.3:  # Ungefähr gleiche Größenordnung
+                betraege_nach_netto.append(b)
+        if betraege_nach_netto:
+            brutto = max(betraege_nach_netto)
+            return {"betrag": brutto, "original": format_betrag(brutto), "typ": "berechnet_brutto"}
+    
+    # 3. Fallback: Suche nach Schlüsselwörtern ohne "brutto"
+    fallback_muster = [
+        r'(?:rechnungsbetrag|zu\s*zahlen|fällig|noch\s*zu\s*zahlend)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        r'(?:gesamtbetrag|endbetrag)[^\d]{0,50}(?:brutto)?[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+        r'(?:zahlbar|betrag)[^\d]*(\d{1,3}(?:\.\d{3})*,\d{2})',
+    ]
+    
+    for muster in fallback_muster:
+        match = re.search(muster, text, re.IGNORECASE)
+        if match:
+            betrag = parse_betrag(match.group(1))
+            if 0 < betrag < 50000:
+                return {"betrag": betrag, "original": match.group(1), "typ": "fallback"}
+    
+    # 4. Letzter Fallback: Höchster realistischer Betrag
     betrag_muster = re.compile(r'(\d{1,3}(?:\.\d{3})*,\d{2})')
     betraege = []
     
@@ -153,7 +198,7 @@ def finde_gesamtpreis(text):
     
     if betraege:
         max_betrag = max(betraege)
-        return {"betrag": max_betrag, "original": format_betrag(max_betrag)}
+        return {"betrag": max_betrag, "original": format_betrag(max_betrag), "typ": "max"}
     
     return None
 
@@ -162,7 +207,7 @@ def finde_datum(text):
     """Extrahiert das Rechnungsdatum"""
     # Zuerst: Suche nach explizitem "Rechnungsdatum"
     rechnungs_datum_muster = re.compile(r'rechnungsdatum[\s:]+(\d{1,2})[\.\/\-](\d{1,2})[\.\/\-](\d{4})', re.IGNORECASE)
-    match = rechnungs_datum_muster.search(text)
+    match = re.search(rechnungs_datum_muster, text)
     if match:
         tag = int(match.group(1))
         monat = int(match.group(2))
@@ -213,12 +258,35 @@ def finde_datum(text):
     return {"tag": tag, "monat": monat, "jahr": jahr, "iso": haeufigstes}
 
 
+def ocr_pdf(datei_pfad):
+    """Versucht OCR auf gescanntem PDF durchzuführen"""
+    if not OCR_VERFUEGBAR:
+        return None
+    
+    try:
+        # Konvertiere PDF zu Bildern
+        bilder = convert_from_path(datei_pfad, dpi=300, first_page=1, last_page=3)
+        
+        text = ""
+        for bild in bilder:
+            # OCR auf jedes Bild
+            seiten_text = pytesseract.image_to_string(bild, lang='deu')
+            text += seiten_text + "\n"
+        
+        return text if len(text.strip()) > 50 else None
+    except Exception as e:
+        print(f"  OCR-Fehler: {e}")
+        return None
+
+
 def verarbeite_pdf(datei_pfad):
     """Verarbeitet eine einzelne PDF-Datei"""
     try:
         text = ""
         seiten = 0
+        ist_gescannt = False
         
+        # Versuche normale Textextraktion
         with pdfplumber.open(datei_pfad) as pdf:
             seiten = len(pdf.pages)
             for page in pdf.pages:
@@ -226,16 +294,32 @@ def verarbeite_pdf(datei_pfad):
                 if page_text:
                     text += page_text + "\n"
         
-        hat_text = len(text.strip()) > 100
-        
-        if not hat_text:
-            return {
-                "datei": os.path.basename(datei_pfad),
-                "pfad": datei_pfad,
-                "gescannt": True,
-                "extrahiert": False,
-                "hinweis": "Gescanntes PDF - OCR nicht verfügbar"
-            }
+        # Wenig Text gefunden? Versuche OCR
+        if len(text.strip()) < 100:
+            ist_gescannt = True
+            print("  📄 Wenig Text gefunden, versuche OCR...")
+            ocr_text = ocr_pdf(datei_pfad)
+            if ocr_text:
+                text = ocr_text
+                ist_gescannt = False  # OCR hat funktioniert
+                print("  ✅ OCR erfolgreich")
+            else:
+                if OCR_VERFUEGBAR:
+                    return {
+                        "datei": os.path.basename(datei_pfad),
+                        "pfad": datei_pfad,
+                        "gescannt": True,
+                        "extrahiert": False,
+                        "hinweis": "Gescanntes PDF - OCR fehlgeschlagen (Tesseract installiert?)"
+                    }
+                else:
+                    return {
+                        "datei": os.path.basename(datei_pfad),
+                        "pfad": datei_pfad,
+                        "gescannt": True,
+                        "extrahiert": False,
+                        "hinweis": "Gescanntes PDF - OCR nicht verfügbar (pip install pdf2image pytesseract)"
+                    }
         
         # Extrahiere alle Daten
         lieferant = finde_lieferant(text)
@@ -248,8 +332,10 @@ def verarbeite_pdf(datei_pfad):
             "lieferant": lieferant,
             "gesamtpreis": gesamtpreis["betrag"] if gesamtpreis else 0.0,
             "gesamtpreis_original": gesamtpreis["original"] if gesamtpreis else '-',
+            "gesamtpreis_typ": gesamtpreis["typ"] if gesamtpreis else '-',
             "datum": datum,
             "seiten": seiten,
+            "ocr_verwendet": ist_gescannt,
             "extrahiert": True
         }
         
@@ -281,7 +367,7 @@ def erstelle_excel(ergebnisse, ziel_pfad):
     ws_haupt.title = "Rechnungen"
     
     # Header
-    headers = ["Lfd. Nr.", "Rechnungsdatum", "Lieferant", "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", "Ursprünglicher Dateiname"]
+    headers = ["Lfd. Nr.", "Rechnungsdatum", "Lieferant", "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", "OCR verwendet", "Ursprünglicher Dateiname"]
     for col, header in enumerate(headers, 1):
         cell = ws_haupt.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
@@ -296,12 +382,17 @@ def erstelle_excel(ergebnisse, ziel_pfad):
         ws_haupt.cell(row=row, column=3, value=e["lieferant"])
         ws_haupt.cell(row=row, column=4, value=format_betrag(e["gesamtpreis"]))
         ws_haupt.cell(row=row, column=5, value=e["seiten"])
-        ws_haupt.cell(row=row, column=6, value=e["datei"])
+        ws_haupt.cell(row=row, column=6, value="Ja" if e.get("ocr_verwendet") else "Nein")
+        ws_haupt.cell(row=row, column=7, value=e["datei"])
     
     # Spaltenbreiten anpassen
-    for col in range(1, 7):
-        ws_haupt.column_dimensions[chr(64 + col)].width = 25
+    ws_haupt.column_dimensions['A'].width = 12
+    ws_haupt.column_dimensions['B'].width = 18
     ws_haupt.column_dimensions['C'].width = 30
+    ws_haupt.column_dimensions['D'].width = 25
+    ws_haupt.column_dimensions['E'].width = 15
+    ws_haupt.column_dimensions['F'].width = 15
+    ws_haupt.column_dimensions['G'].width = 40
     
     # Monatsauswertung
     ws_monat = wb.create_sheet("Monatsauswertung")
@@ -366,6 +457,12 @@ def main():
     
     print(f"📁 Verarbeite PDFs in: {quell_ordner}\n")
     
+    if OCR_VERFUEGBAR:
+        print("✅ OCR-Unterstützung verfügbar (für gescannte PDFs)\n")
+    else:
+        print("ℹ️  OCR nicht verfügbar - nur digitale PDFs können verarbeitet werden")
+        print("   (pip install pdf2image pytesseract für OCR-Support)\n")
+    
     # Finde alle PDFs (ohne bereits umbenannte)
     prefix_lower = CONFIG["prefix"].lower()
     dateien = [
@@ -404,7 +501,9 @@ def main():
             
             print(f"     Lieferant: {daten['lieferant']}")
             print(f"     Datum: {daten['datum']['iso'] if daten['datum'] else '-'}")
-            print(f"     Gesamtpreis: {format_betrag(daten['gesamtpreis'])} €")
+            print(f"     Gesamtpreis: {format_betrag(daten['gesamtpreis'])} € (Brutto)")
+            if daten.get("ocr_verwendet"):
+                print(f"     ℹ️  OCR verwendet")
         elif daten.get("gescannt"):
             print(f"  ⚠️  Übersprungen: {daten['hinweis']}")
         else:
@@ -423,7 +522,7 @@ def main():
     print("\n📊 Zusammenfassung:")
     print(f"   Erfolgreich verarbeitet: {erfolgreich}")
     print(f"   Fehler: {fehler}")
-    print(f"   Gesamtsumme: {format_betrag(gesamt_summe)} €")
+    print(f"   Gesamtsumme: {format_betrag(gesamt_summe)} € (Brutto)")
     print(f"\n📂 Excel erstellt: {CONFIG['excel_datei']}")
     
     # Warte auf Tastendruck

@@ -1,2 +1,8 @@
+# Pflicht
 pdfplumber>=0.10.0
 openpyxl>=3.1.0
+
+# Optional (für OCR bei gescannten PDFs)
+# pdf2image>=1.16.0
+# pytesseract>=0.3.10
+# (benötigt zusätzlich: Tesseract-OCR und poppler)

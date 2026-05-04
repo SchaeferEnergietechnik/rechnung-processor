@@ -1,0 +1,18 @@
+{
+  "name": "rechnungsbearbeitung",
+  "version": "1.0.0",
+  "description": "PDF-Rechnungen einlesen, umbenennen und nach Excel exportieren",
+  "main": "rechnung-processor.js",
+  "scripts": {
+    "start": "node rechnung-processor.js",
+    "process": "node rechnung-processor.js"
+  },
+  "dependencies": {
+    "pdf-parse": "^1.1.1",
+    "pdf2pic": "^3.2.0",
+    "tesseract.js": "^7.0.0",
+    "xlsx": "^0.18.5"
+  },
+  "author": "G.E.S. Energietechnik",
+  "license": "MIT"
+}
