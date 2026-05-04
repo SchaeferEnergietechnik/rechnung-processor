@@ -7,7 +7,7 @@ on:
       - 'v*'
   pull_request:
     branches: [main, master]
-  workflow_dispatch:  # Manuelles Triggern möglich
+  workflow_dispatch:
 
 jobs:
   build:
@@ -22,16 +22,10 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Install system dependencies (Tesseract)
-        run: |
-          choco install tesseract
-          choco install poppler
-      
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pdf2image pytesseract pyinstaller
+          pip install pdfplumber openpyxl pyinstaller
       
       - name: Build executable
         run: |
