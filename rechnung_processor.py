@@ -8,8 +8,8 @@ Funktionen:
 - Liest PDFs aus dem Ordner, in dem das Script liegt
 - Extrahiert: Gesamtpreis (inkl. MwSt), Lieferant, Rechnungsdatum
 - OCR-Unterstützung für gescannte PDFs (falls Tesseract installiert)
-- Benennt um: 26-xxx_YYYY-MM-DD_Lieferant_Gesamtpreis.pdf
-- Schreibt Excel mit Auswertung
+- Benennt um: 26-xxx_Lieferant_YYYY-MM-DD_Gesamtpreis.pdf
+- Schreibt Excel mit Auswertung, deutschem Datum und Monatssummen
 
 Usage: python rechnung_processor.py
     oder als .exe mit PyInstaller
