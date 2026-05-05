@@ -802,9 +802,9 @@ def main():
     
     print(f"📄 {len(dateien)} neue PDF(s) gefunden. Verarbeite...\n")
     
-    # Verarbeite alle PDFs und ermittle Nummern VOR dem Umbenennen
+    # Verarbeite alle PDFs - Nummerierung JÄHRLICH fortlaufend (nicht monatsbasiert)
     ergebnisse = []
-    monats_nummern_counter = defaultdict(int)  # Temporär für Nummernvergabe
+    jahres_nummern_counter = defaultdict(int)  # Speichert aktuelle Nummer pro Jahr
     
     for i, pfad in enumerate(dateien, 1):
         datei_name = os.path.basename(pfad)
@@ -822,15 +822,25 @@ def main():
                 daten["neuer_name"] = generiere_dateiname(daten, 0, ist_duplikat=True)
                 print(f"  ⚠️  Duplikat erkannt (Rechnungsnr: {rechnungsnr})")
             else:
-                # Monat ermitteln für Nummerierung
+                # JAHR ermitteln für Nummerierung (jeder Jahres-Start bei 001)
                 if datum_iso:
-                    monat_key = datum_iso[:7]
+                    jahr_key = datum_iso[:4]  # YYYY
                 else:
-                    monat_key = "0000-00"
+                    jahr_key = "0000"
                 
-                # Nummer aus Excel-Bestand + aktuelle Dateien
-                aktuelle_nummer = monats_hoechste_nummer.get(monat_key, 0) + monats_nummern_counter[monat_key] + 1
-                monats_nummern_counter[monat_key] += 1
+                # Ermittle höchste Nummer für dieses Jahr aus Excel-Bestand
+                hoechste_im_jahr = 0
+                for e in bestehende_eintraege:
+                    try:
+                        if e.get("datum_iso", "").startswith(jahr_key):
+                            nr = int(e.get("lfd_nr", "0").replace(CONFIG["prefix"], ""))
+                            hoechste_im_jahr = max(hoechste_im_jahr, nr)
+                    except:
+                        pass
+                
+                # Nächste Nummer = höchste aus Bestand + laufende in dieser Session + 1
+                aktuelle_nummer = hoechste_im_jahr + jahres_nummern_counter[jahr_key] + 1
+                jahres_nummern_counter[jahr_key] += 1
                 
                 daten["ist_duplikat"] = False
                 daten["neuer_name"] = generiere_dateiname(daten, aktuelle_nummer)
