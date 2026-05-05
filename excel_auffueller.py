@@ -229,8 +229,9 @@ def main():
     excel_pfad = os.path.join(ordner, CONFIG["excel_datei"])
     bestehende_eintraege, _ = lade_excel_bestand(excel_pfad)
     
-    # Suche nach bereits umbenannten PDFs (Format: XX-XXX_Lieferant_Datum_PreisEUR.pdf)
-    pattern = r'^(\d{2}-\d{3})_(.+)_(\d{4}-\d{2}-\d{2})_(.+?)EUR\.pdf$'
+    # Suche nach bereits umbenannten PDFs
+    # Format: XX-XXX_Lieferant_YYYY-MM-DD_PreisEUR.pdf oder XX-XXX_Lieferant_YYYY-MM-DD_PreisEUR---GUID.pdf
+    pattern = r'^(\d{2}-\d{3})_(.+)_(\d{4}-\d{2}-\d{2})_(.+?)EUR'
     
     dateien = [
         f for f in os.listdir(ordner)

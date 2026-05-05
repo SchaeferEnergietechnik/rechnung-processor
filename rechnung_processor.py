@@ -246,15 +246,34 @@ def finde_rechnungsnummer(text):
 
 
 def finde_gesamtpreis(text):
-    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt)"""
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version"""
     text_lower = text.lower()
     alle_kandidaten = []
     
-    # Flexible Muster für verschiedene Zahlenformate
+    # HÖCHSTE Priorität: "Gesamtbetrag" oder "Gesamt" als Schlüsselwort
+    # Muster: "Gesamtbetrag 22,32" oder "Gesamtbetrag: 22,32"
+    gesamt_patterns = [
+        (r'gesamtbetrag[:\s]+(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 200),  # Höchste Prio!
+        (r'gesamtbetrag.*?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 190),
+        (r'gesamt.*?(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*(?:eur|€)', 180),
+    ]
+    
+    for pattern, prio in gesamt_patterns:
+        matches = list(re.finditer(pattern, text_lower))
+        for m in matches:
+            betrag = parse_betrag(m.group(1))
+            if 0 < betrag < 50000:
+                # Prüfe Kontext - Ausschluss von "netto", "vor steuer"
+                context = text_lower[max(0, m.start()-20):m.end()]
+                if any(bad in context for bad in ['nettobetrag', 'vor steuer', 'ohne mwst', 'netto']):
+                    if prio > 100:  # Nur downgrade, nicht ausschließen
+                        prio = 50
+                alle_kandidaten.append((betrag, prio, m.group(1), "gesamtbetrag"))
+    
+    # HOHE Priorität: Summe, Zahlbetrag
     hoch_prio_patterns = [
-        (r'(?:summe|gesamtpreis|zahlbetrag)[\s:]+(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*(?:eur|€)?', 110),
-        (r'(?:summe|gesamtpreis)[\s:]+(?:eur|€)?\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 110),
-        (r'zahlbetrag[\s:]+(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 105),
+        (r'(?:summe|zahlbetrag)[\s:]+(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})\s*(?:eur|€)?', 110),
+        (r'(?:summe|zahlbetrag)[\s:]+(?:eur|€)?\s*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 110),
         (r'(?:noch\s+zu\s+zahlender\s+betrag|rechnungsbetrag)[^\d]{0,50}(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 100),
         (r'(?:zu\s*zahlen|fällig)[^\d]{0,50}(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 90),
         (r'zahlbar[^\d]{0,100}(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', 80),
@@ -270,7 +289,7 @@ def finde_gesamtpreis(text):
             if 0 < betrag < 50000:
                 context_start = max(0, m.start() - 30)
                 context = text[context_start:m.start()].lower()
-                if any(bad in context for bad in ['versandkosten', 'rabatt', 'discount', 'einzelpreis', 'zwischensumme']):
+                if any(bad in context for bad in ['versandkosten', 'rabatt', 'discount', 'einzelpreis', 'zwischensumme', 'netto']):
                     continue
                 alle_kandidaten.append((betrag, prio, m.group(1), "endbetrag"))
     
@@ -281,17 +300,12 @@ def finde_gesamtpreis(text):
         if 0 < betrag < 50000:
             alle_kandidaten.append((betrag, 95, match.group(1), "bruttowert"))
     
-    # Gesamtbetrag
-    gesamt_matches = list(re.finditer(r'gesamtbetrag[:\s]*(\d{1,3}(?:[.,]\d{3})*[.,]\d{2})', text, re.IGNORECASE))
-    if len(gesamt_matches) > 1:
-        betraege = [(parse_betrag(m.group(1)), m.group(1)) for m in gesamt_matches if 0 < parse_betrag(m.group(1)) < 50000]
-        if betraege:
-            max_betrag, original = max(betraege, key=lambda x: x[0])
-            alle_kandidaten.append((max_betrag, 70, original, "gesamtbetrag_max"))
-    elif gesamt_matches:
-        betrag = parse_betrag(gesamt_matches[0].group(1))
-        if 0 < betrag < 50000:
-            alle_kandidaten.append((betrag, 70, gesamt_matches[0].group(1), "gesamtbetrag"))
+    # Wenn mehrere Gesamtbeträge gefunden wurden, nimm den HÖCHSTEN (Brutto > Netto)
+    gesamt_eintraege = [x for x in alle_kandidaten if x[3] == "gesamtbetrag"]
+    if len(gesamt_eintraege) > 1:
+        # Nimm den höchsten Betrag bei mehreren "Gesamtbetrag"-Treffern
+        max_eintrag = max(gesamt_eintraege, key=lambda x: x[0])
+        alle_kandidaten = [max_eintrag] + [x for x in alle_kandidaten if x[3] != "gesamtbetrag"]
     
     # Fallback: EUR-Beträge in der Nähe von "gesamt" oder "summe"
     if not alle_kandidaten:
@@ -305,6 +319,7 @@ def finde_gesamtpreis(text):
                     alle_kandidaten.append((betrag, 60, m.group(1), "eur_kontext"))
     
     if alle_kandidaten:
+        # Sortiere nach Priorität, dann nach Betrag (höchster zuerst bei gleicher Prio)
         alle_kandidaten.sort(key=lambda x: (x[1], x[0]), reverse=True)
         best_betrag, best_prio, best_orig, best_typ = alle_kandidaten[0]
         return {"betrag": best_betrag, "original": best_orig, "typ": best_typ}
@@ -313,17 +328,18 @@ def finde_gesamtpreis(text):
 
 
 def finde_datum(text):
-    """Extrahiert das Rechnungsdatum aus dem Text"""
+    """Extrahiert das RECHNUNGSDATUM aus dem Text - prioritär"""
     text_clean = text.replace('\n', ' ')
     
-    rechnungs_patterns = [
-        r'ReCHNUNGSDATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
-        r'ReCHNUNG[^\n]{0,100}DATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
-        r'DATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})[^\n]{0,50}RECHNUNG',
+    # HÖCHSTE Priorität: Explizites "Rechnungsdatum" oder "Datum" + Kontext
+    prio_patterns = [
+        r'(?:RECHNUNGSDATUM|Rechnungsdatum)[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
+        r'(?:Rechnung|Rechnungs-Nr\.?)[^\d]{0,50} vom (\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
+        r'Datum\s*:\s*(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',  # Einfaches "Datum: TT.MM.JJJJ"
     ]
     
-    for pattern in rechnungs_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+    for pattern in prio_patterns:
+        match = re.search(pattern, text_clean, re.IGNORECASE)
         if match:
             tag = int(match.group(1))
             monat = int(match.group(2))
@@ -332,6 +348,7 @@ def finde_datum(text):
                 iso = f"{jahr:04d}-{monat:02d}-{tag:02d}"
                 return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
     
+    # FALLBACK: Alle Datums durchgehen, aber ausschließen wenn in Zahlungs-Kontext
     datum_pattern = r'(?:\D|^)(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})(?:\D|$)'
     alle_datum = []
     
@@ -341,26 +358,43 @@ def finde_datum(text):
         jahr = int(match.group(3))
         
         if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
-            context_start = max(0, match.start() - 100)
-            context_end = min(len(text_clean), match.end() + 50)
+            context_start = max(0, match.start() - 150)
+            context_end = min(len(text_clean), match.end() + 150)
             context = text_clean[context_start:context_end].lower()
             
-            ist_rechnung = re.search(r'rechnung|rechnungsdatum|fällig|zahlbar', context, re.IGNORECASE)
-            ist_lieferung = re.search(r'liefer|versand', context, re.IGNORECASE)
-            ist_bestellung = re.search(r'bestell', context, re.IGNORECASE)
+            # NEGATIVE Keywords - diese Datums ausschließen (Zahlungsfristen)
+            if any(neg in context for neg in ['zahlbar bis', 'zahlen bis', 'fällig bis', 
+                                                'zahldatum', 'zahlung bis', 'within', 'due by',
+                                                'zahlbetrag', 'zahlung']):
+                continue
             
-            gewicht = 3 if ist_rechnung else (2 if ist_lieferung else (1 if ist_bestellung else 0))
-            if gewicht > 0:
-                iso = f"{jahr:04d}-{monat:02d}-{tag:02d}"
-                alle_datum.append({"tag": tag, "monat": monat, "jahr": jahr, "iso": iso, "gewicht": gewicht})
+            # POSITIVE Keywords - Rechnungs-Kontext (erweitert!)
+            ist_rechnung = re.search(r'rechnung|rechnungsdatum|rechnungsnr|r[eé]f\.?\s*facture', context, re.IGNORECASE)
+            ist_lieferung = re.search(r'lieferdatum|versanddatum|bestelldatum|auftragsdatum', context, re.IGNORECASE)
+            ist_beleg = re.search(r'belegdatum|buchungsdatum', context, re.IGNORECASE)
+            ist_datum_label = re.search(r'datum\s*:', context, re.IGNORECASE)
+            
+            gewicht = 0
+            if ist_rechnung:
+                gewicht = 10
+            elif ist_datum_label:
+                gewicht = 8  # "Datum:" Label ist starkes Indiz
+            elif ist_lieferung:
+                gewicht = 5
+            elif ist_beleg:
+                gewicht = 4
+            else:
+                gewicht = 1  # Neutral
+            
+            iso = f"{jahr:04d}-{monat:02d}-{tag:02d}"
+            alle_datum.append({"tag": tag, "monat": monat, "jahr": jahr, "iso": iso, "gewicht": gewicht})
     
     if not alle_datum:
         return None
     
-    beste_kandidaten = [(d["gewicht"], d["jahr"], d["monat"], d["tag"], d["iso"]) for d in alle_datum]
-    beste_kandidaten.sort(reverse=True)
-    _, jahr, monat, tag, iso = beste_kandidaten[0]
-    return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
+    # Nimm das mit höchstem Gewicht
+    beste = max(alle_datum, key=lambda x: x["gewicht"])
+    return {"tag": beste["tag"], "monat": beste["monat"], "jahr": beste["jahr"], "iso": beste["iso"]}
 
 
 def ocr_pdf_online(datei_pfad):
