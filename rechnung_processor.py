@@ -6,9 +6,11 @@ Rechnungsbearbeitung - PDF-Rechnungen verarbeiten (Python Version)
 
 Funktionen:
 - Liest PDFs aus dem Ordner, in dem das Script liegt
-- Extrahiert: Gesamtpreis (inkl. MwSt), Lieferant, Rechnungsdatum
+- Extrahiert: Gesamtpreis (inkl. MwSt), Lieferant, Rechnungsdatum, Rechnungsnummer
 - OCR-Unterstützung für gescannte PDFs (falls Tesseract installiert)
 - Benennt um: 26-xxx_Lieferant_YYYY-MM-DD_Gesamtpreis.pdf
+- Monatsbasierte Nummerierung (26-001 für jeden Monat neu)
+- Duplikat-Check via Rechnungsnummer
 - Schreibt Excel mit Auswertung, deutschem Datum und Monatssummen
 
 Usage: python rechnung_processor.py
@@ -128,19 +130,9 @@ def finde_lieferant(text):
         return 'TTT-Filmservice'
     
     # AMAZON SPEZIAL: Wenn "Amazon" im Text ist, immer Amazon als Lieferant
-    # (egal wer "Verkauft von" ist)
     if 'amazon eu' in text_lower or 'amazon' in text_lower:
-        # Prüfe ob es wirklich eine Amazon-Rechnung ist
         if 'bestellnummer' in text_lower or 'amazon.de' in text_lower or 'verkauft von' in text_lower:
             return 'Amazon'
-    
-    # Suche nach explizitem "Rechnung" + Firma
-    if 're-invent retail' in text_lower or 're-invent' in text_lower:
-        return 'RE-INvent_Retail'
-    if 'voelkner' in text_lower:
-        return 'Voelkner'
-    if 'steinke' in text_lower:
-        return 'Steinke'
     
     # Suche nach explizitem "Rechnung" + Firma
     rechnung_pattern = re.search(r'ReCHNUNG\s*\n?\s*([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))', text, re.IGNORECASE)
@@ -149,8 +141,7 @@ def finde_lieferant(text):
         if ist_gueltiger_lieferant(kandidat):
             return bereinige_lieferant(kandidat)
     
-    # Suche nach Firmen die G.E.S. beliefert (Firma vor oder nach G.E.S.)
-    # Muster: Firma GmbH ... G.E.S. Energietechnik
+    # Suche nach Firmen die G.E.S. beliefert
     ges_pattern = re.search(r'([A-Z][A-Za-zäöüß\s&\.]+(?:GmbH|AG|KG|OHG|e\.?K|UG))[^.]{0,200}G\.E\.S', text, re.IGNORECASE | re.DOTALL)
     if ges_pattern:
         kandidat = ges_pattern.group(1).strip()
@@ -180,11 +171,9 @@ def ist_gueltiger_lieferant(name):
     if len(name) < 5:
         return False
     name_lower = name.lower()
-    # Prüfe Stoppwörter
     for stop in STOPP_WORTER:
         if stop in name_lower:
             return False
-    # Prüfe dass es keine reinen Betragsbezeichnungen sind
     if re.match(r'^(gesamt|rechnungs|end|brutto|netto|summe)', name_lower):
         return False
     return True
@@ -192,19 +181,13 @@ def ist_gueltiger_lieferant(name):
 
 def bereinige_lieferant(name):
     """Bereinigt den Lieferantennamen für Dateinamen"""
-    # Entferne Leerzeichen am Anfang/Ende
     fixed = name.strip()
-    
-    # Fixe häufige OCR-Fehler bei Umlauten (ERST spezifische, DANN generische!)
-    fixed = re.sub(r'ttcher', 'ttcher', fixed, flags=re.IGNORECASE)  # Placeholder
     fixed = re.sub(r'bottcher', 'Böttcher', fixed, flags=re.IGNORECASE)
     fixed = re.sub(r'schaefer', 'Schäfer', fixed, flags=re.IGNORECASE)
     
-    # Generische Umlaut-Fixe NUR wenn nicht schon Umlaute vorhanden
     if 'ä' not in fixed and 'ö' not in fixed and 'ü' not in fixed:
         fixed = fixed.replace('ae', 'ä').replace('oe', 'ö').replace('ue', 'ü').replace('ss', 'ß')
     
-    # Entferne ungültige Zeichen für Dateinamen
     fixed = re.sub(r'[\\/:*?"<>|]', '_', fixed)
     fixed = re.sub(r'\s+', '_', fixed)
     fixed = re.sub(r'_+', '_', fixed)
@@ -213,16 +196,34 @@ def bereinige_lieferant(name):
     return fixed[:40]
 
 
+def finde_rechnungsnummer(text):
+    """Extrahiert die Rechnungsnummer aus dem Text"""
+    patterns = [
+        r'Rechnungsnummer\s*:?\s*([A-Z0-9\-]+)',
+        r'Rechnungsnummer[:\s]+(\d{4,20})',
+        r'(?:Rechnung|Rechnungsnr)[\.\s#:]*([A-Z0-9\-]{3,30})',
+        r'(?:R|RG)[\-\s]?[Nn]r?\.?\s*:?\s*([A-Z0-9\-]{3,30})',
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        if matches:
+            best_match = max(matches, key=len)
+            best_match = best_match.strip().strip(':')
+            if len(best_match) >= 3:
+                return best_match
+    
+    return None
+
+
 def finde_gesamtpreis(text):
-    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt) - verbesserte Version v3"""
+    """Findet den BRUTTO-Gesamtbetrag (inkl. MwSt)"""
     text_lower = text.lower()
     alle_kandidaten = []
     
-    # 0. HÖCHSTE Priorität: "Summe:" oder "Gesamtpreis" am Ende der Rechnung
-    # Dies ist oft der finale Betrag
     hoch_prio_patterns = [
-        (r'(?:summe|gesamtpreis|zahlbetrag)[\s:]+(\d{1,3}(?:\.\d{3})*,\d{2})\s*eur', 110),  # "Summe: 24,75 EUR"
-        (r'gesamtpreis\s+(\d{1,3}(?:\.\d{3})*,\d{2})', 110),  # Amazon: "Gesamtpreis 9,47"
+        (r'(?:summe|gesamtpreis|zahlbetrag)[\s:]+(\d{1,3}(?:\.\d{3})*,\d{2})\s*eur', 110),
+        (r'gesamtpreis\s+(\d{1,3}(?:\.\d{3})*,\d{2})', 110),
         (r'(?:noch\s+zu\s+zahlender\s+betrag|rechnungsbetrag)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 100),
         (r'(?:zu\s*zahlen|fällig)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', 90),
         (r'zahlbar[^\d]{0,100}(\d{1,3}(?:\.\d{3})*,\d{2})', 80),
@@ -233,32 +234,18 @@ def finde_gesamtpreis(text):
         for m in matches:
             betrag = parse_betrag(m.group(1))
             if 0 < betrag < 50000:
-                # Prüfe Kontext - vermeide "Versandkosten", "Aktionsrabatt" etc.
                 context_start = max(0, m.start() - 30)
                 context = text[context_start:m.start()].lower()
                 if any(bad in context for bad in ['versandkosten', 'rabatt', 'discount', 'einzelpreis', 'zwischensumme']):
-                    continue  # Überspringe diese Treffer
+                    continue
                 alle_kandidaten.append((betrag, prio, m.group(1), "endbetrag"))
     
-    # 1. "Summe Bruttowert" (Voelkner-Style)
     match = re.search(r'summe\s+bruttowert[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE)
     if match:
         betrag = parse_betrag(match.group(1))
         if 0 < betrag < 50000:
             alle_kandidaten.append((betrag, 95, match.group(1), "bruttowert"))
     
-    # 2. "Gesamtbetrag brutto" / "Endbetrag"
-    brutto_patterns = [
-        r'(?:endbetrag|gesamtbetrag)\s+brutto[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})',
-    ]
-    for pattern in brutto_patterns:
-        matches = list(re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE))
-        for m in matches:
-            betrag = parse_betrag(m.group(1))
-            if 0 < betrag < 50000:
-                alle_kandidaten.append((betrag, 85, m.group(1), "brutto_explicit"))
-    
-    # 3. Generische "Gesamtbetrag" - sammle ALLE und nimm den HÖCHSTEN
     gesamt_matches = list(re.finditer(r'gesamtbetrag[:\s]*(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
     if len(gesamt_matches) > 1:
         betraege = [(parse_betrag(m.group(1)), m.group(1)) for m in gesamt_matches if 0 < parse_betrag(m.group(1)) < 50000]
@@ -270,31 +257,6 @@ def finde_gesamtpreis(text):
         if 0 < betrag < 50000:
             alle_kandidaten.append((betrag, 70, gesamt_matches[0].group(1), "gesamtbetrag"))
     
-    # 4. Wenn "Netto" gefunden → berechne Brutto (Netto * 1.19)
-    netto_matches = list(re.finditer(r'(?:netto|warenwert)[^\d]{0,50}(\d{1,3}(?:\.\d{3})*,\d{2})', text, re.IGNORECASE))
-    if netto_matches:
-        netto_betraege = [(m, parse_betrag(m.group(1))) for m in netto_matches if 0 < parse_betrag(m.group(1)) < 50000]
-        if netto_betraege:
-            netto_match, netto_betrag = max(netto_betraege, key=lambda x: x[1])
-            brutto_berechnet = round(netto_betrag * 1.19, 2)
-            
-            for betrag, prio, orig, typ in alle_kandidaten[:]:
-                if abs(betrag - brutto_berechnet) < 0.5:
-                    alle_kandidaten.remove((betrag, prio, orig, typ))
-                    alle_kandidaten.append((betrag, 95, orig, "brutto_verifiziert"))
-    
-    # 5. Fallback: Höchster Betrag in der ganzen Rechnung
-    all_betraege = []
-    for m in re.finditer(r'(\d{1,3}(?:\.\d{3})*,\d{2})', text):
-        b = parse_betrag(m.group(1))
-        if 0 < b < 50000:
-            all_betraege.append(b)
-    if all_betraege:
-        max_betrag = max(all_betraege)
-        if not any(prio >= 80 for betrag, prio, orig, typ in alle_kandidaten):
-            alle_kandidaten.append((max_betrag, 10, format_betrag(max_betrag), "max"))
-    
-    # Wähle den besten Kandidaten
     if alle_kandidaten:
         alle_kandidaten.sort(key=lambda x: (x[1], x[0]), reverse=True)
         best_betrag, best_prio, best_orig, best_typ = alle_kandidaten[0]
@@ -304,11 +266,9 @@ def finde_gesamtpreis(text):
 
 
 def finde_datum(text):
-    """Extrahiert das Rechnungsdatum - verbesserte Version"""
-    text_lower = text.lower()
+    """Extrahiert das Rechnungsdatum aus dem Text"""
+    text_clean = text.replace('\n', ' ')
     
-    # 1. HÖCHSTE Priorität: Explizites "Rechnungsdatum" oder "Rechnung ... Datum"
-    # Muster: "Rechnungsdatum: 21.04.2026" oder "Rechnung Nr. ... Datum: 21.04.2026"
     rechnungs_patterns = [
         r'ReCHNUNGSDATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
         r'ReCHNUNG[^\n]{0,100}DATUM[:\s]+(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})',
@@ -322,57 +282,38 @@ def finde_datum(text):
             monat = int(match.group(2))
             jahr = int(match.group(3))
             if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
-                return {"tag": tag, "monat": monat, "jahr": jahr, "iso": f"{jahr}-{monat:02d}-{tag:02d}"}
+                iso = f"{jahr:04d}-{monat:02d}-{tag:02d}"
+                return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
     
-    # 2. Suche nach "Datum" in Verbindung mit "Rechnung" in der Nähe
-    # Prüfe alle "Datum" Vorkommen
-    datum_matches = list(re.finditer(r'(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})', text))
-    beste_kandidaten = []
+    datum_pattern = r'(?:\D|^)(\d{1,2})[\.\/](\d{1,2})[\.\/](\d{4})(?:\D|$)'
+    alle_datum = []
     
-    for match in datum_matches:
+    for match in re.finditer(datum_pattern, text_clean):
         tag = int(match.group(1))
         monat = int(match.group(2))
         jahr = int(match.group(3))
         
-        if not (1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030):
-            continue
-        
-        # Kontext um das Datum prüfen
-        context_start = max(0, match.start() - 100)
-        context_end = min(len(text), match.end() + 100)
-        context = text[context_start:context_end].lower()
-        
-        # Prio basierend auf Kontext
-        prio = 0
-        if 'rechnungsdatum' in context:
-            prio = 100
-        elif 'rechnung' in context and 'datum' in context:
-            prio = 90
-        elif 'rechnung' in context:
-            prio = 80
-        elif 'datum' in context:
-            prio = 70
-        else:
-            prio = 10  # Fallback
-        
-        # Reduziere Prio bei Verbrauchs-/Zeitraum-Kontext
-        if re.search(r'verbrauch|zeitraum|von.*bis|abrechnungszeitraum|lieferzeitraum', context):
-            prio -= 50
-        
-        # Reduziere Prio bei "Auftragsdatum", "Lieferscheindatum", etc.
-        if re.search(r'auftragsdatum|lieferscheindatum|versanddatum|bestelldatum', context):
-            prio -= 30
-        
-        if prio > 0:
-            beste_kandidaten.append((prio, jahr, monat, tag, f"{jahr}-{monat:02d}-{tag:02d}"))
+        if 1 <= tag <= 31 and 1 <= monat <= 12 and 2020 <= jahr <= 2030:
+            context_start = max(0, match.start() - 100)
+            context_end = min(len(text_clean), match.end() + 50)
+            context = text_clean[context_start:context_end].lower()
+            
+            ist_rechnung = re.search(r'rechnung|rechnungsdatum|fällig|zahlbar', context, re.IGNORECASE)
+            ist_lieferung = re.search(r'liefer|versand', context, re.IGNORECASE)
+            ist_bestellung = re.search(r'bestell', context, re.IGNORECASE)
+            
+            gewicht = 3 if ist_rechnung else (2 if ist_lieferung else (1 if ist_bestellung else 0))
+            if gewicht > 0:
+                iso = f"{jahr:04d}-{monat:02d}-{tag:02d}"
+                alle_datum.append({"tag": tag, "monat": monat, "jahr": jahr, "iso": iso, "gewicht": gewicht})
     
-    # Wähle den besten Kandidaten (höchste Prio)
-    if beste_kandidaten:
-        beste_kandidaten.sort(reverse=True)
-        _, jahr, monat, tag, iso = beste_kandidaten[0]
-        return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
+    if not alle_datum:
+        return None
     
-    return None
+    beste_kandidaten = [(d["gewicht"], d["jahr"], d["monat"], d["tag"], d["iso"]) for d in alle_datum]
+    beste_kandidaten.sort(reverse=True)
+    _, jahr, monat, tag, iso = beste_kandidaten[0]
+    return {"tag": tag, "monat": monat, "jahr": jahr, "iso": iso}
 
 
 def ocr_pdf_online(datei_pfad):
@@ -384,19 +325,15 @@ def ocr_pdf_online(datei_pfad):
     if not api_key:
         return None
     
-    # Prüfe Dateigröße (max 1MB für Free-Tier)
     datei_groesse = os.path.getsize(datei_pfad)
-    if datei_groesse > 1024 * 1024:  # 1 MB
+    if datei_groesse > 1024 * 1024:
         print(f"  ⚠️  Datei zu groß für Free-OCR ({datei_groesse / 1024 / 1024:.2f} MB > 1 MB)")
         return None
     
     try:
         print("  🌐 Versuche Online-OCR (OCR.space)...")
-        
-        # API Endpoint
         url = "https://api.ocr.space/parse/image"
         
-        # Datei hochladen
         with open(datei_pfad, 'rb') as f:
             response = requests.post(
                 url,
@@ -404,12 +341,12 @@ def ocr_pdf_online(datei_pfad):
                 data={
                     "apikey": api_key,
                     "language": "ger",
-                    "OCREngine": "2",  # Bessere Erkennung
+                    "OCREngine": "2",
                     "isTable": "false",
                     "detectOrientation": "true",
                     "scale": "true"
                 },
-                timeout=120  # Erhöht auf 120 Sekunden
+                timeout=120
             )
         
         if response.status_code == 200:
@@ -448,12 +385,10 @@ def ocr_pdf(datei_pfad):
         return None
     
     try:
-        # Konvertiere PDF zu Bildern
         bilder = convert_from_path(datei_pfad, dpi=300, first_page=1, last_page=3)
         
         text = ""
         for bild in bilder:
-            # OCR auf jedes Bild
             seiten_text = pytesseract.image_to_string(bild, lang='deu')
             text += seiten_text + "\n"
         
@@ -470,7 +405,6 @@ def verarbeite_pdf(datei_pfad):
         seiten = 0
         ist_gescannt = False
         
-        # Versuche normale Textextraktion
         with pdfplumber.open(datei_pfad) as pdf:
             seiten = len(pdf.pages)
             for page in pdf.pages:
@@ -478,26 +412,22 @@ def verarbeite_pdf(datei_pfad):
                 if page_text:
                     text += page_text + "\n"
         
-        # Wenig Text gefunden? Versuche OCR
         if len(text.strip()) < 100:
             ist_gescannt = True
             print("  📄 Wenig Text gefunden, versuche OCR...")
             
-            # 1. Versuche lokales OCR (Tesseract)
             ocr_text = ocr_pdf(datei_pfad)
             if ocr_text:
                 text = ocr_text
-                ist_gescannt = False  # OCR hat funktioniert
+                ist_gescannt = False
                 print("  ✅ Lokales OCR erfolgreich (Tesseract)")
             else:
-                # 2. Versuche Online-OCR (OCR.space)
                 ocr_text = ocr_pdf_online(datei_pfad)
                 if ocr_text:
                     text = ocr_text
-                    ist_gescannt = True  # Online-OCR war nötig
+                    ist_gescannt = True
                     print("  ✅ Online-OCR erfolgreich (OCR.space)")
                 else:
-                    # Beide OCR-Methoden fehlgeschlagen
                     if OCR_VERFUEGBAR or REQUESTS_VERFUEGBAR:
                         return {
                             "datei": os.path.basename(datei_pfad),
@@ -515,10 +445,10 @@ def verarbeite_pdf(datei_pfad):
                             "hinweis": "Gescanntes PDF - keine OCR verfügbar (lokal: pip install pdf2image pytesseract | online: pip install requests)"
                         }
         
-        # Extrahiere alle Daten
         lieferant = finde_lieferant(text)
         gesamtpreis = finde_gesamtpreis(text)
         datum = finde_datum(text)
+        rechnungsnummer = finde_rechnungsnummer(text)
         
         return {
             "datei": os.path.basename(datei_pfad),
@@ -528,6 +458,7 @@ def verarbeite_pdf(datei_pfad):
             "gesamtpreis_original": gesamtpreis["original"] if gesamtpreis else '-',
             "gesamtpreis_typ": gesamtpreis["typ"] if gesamtpreis else '-',
             "datum": datum,
+            "rechnungsnummer": rechnungsnummer if rechnungsnummer else '-',
             "seiten": seiten,
             "ocr_verwendet": ist_gescannt,
             "extrahiert": True
@@ -542,92 +473,135 @@ def verarbeite_pdf(datei_pfad):
         }
 
 
-def generiere_dateiname(daten, nummer):
-    """Generiert neuen Dateinamen: 26-001_Lieferant_2026-04-21_Summe.pdf"""
+def generiere_dateiname(daten, nummer, ist_duplikat=False):
+    """Generiert neuen Dateinamen: 26-001_Lieferant_2026-04-21_Summe.pdf oder doppelt_26-001_..."""
     nummer_str = f"{CONFIG['prefix']}{nummer:03d}"
     lieferant_safe = daten["lieferant"]
     datum_str = daten["datum"]["iso"] if daten["datum"] else "0000-00-00"
     preis_str = format_betrag(daten["gesamtpreis"])
     
+    if ist_duplikat:
+        return f"doppelt_{nummer_str}_{lieferant_safe}_{datum_str}_{preis_str}EUR.pdf"
     return f"{nummer_str}_{lieferant_safe}_{datum_str}_{preis_str}EUR.pdf"
 
 
-def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
-    """Aktualisiert oder erstellt die Excel-Datei mit fortlaufender Liste"""
-    from collections import defaultdict
-    
-    # Lade bestehende Excel wenn vorhanden
+def lade_excel_bestand(ziel_pfad):
+    """Lädt bestehende Excel und extrahiert Rechnungsnummern für Duplikat-Check"""
     bestehende_eintraege = []
-    if os.path.exists(ziel_pfad):
-        try:
-            wb_alt = load_workbook(ziel_pfad)
-            ws_alt = wb_alt["Rechnungen"]
-            
-            # Lese bestehende Einträge (ab Zeile 2, da Zeile 1 = Header)
-            for row in ws_alt.iter_rows(min_row=2, values_only=True):
-                if row[0] and row[1] and row[2]:  # Lfd. Nr., Datum, Lieferant
-                    bestehende_eintraege.append({
-                        "lfd_nr": row[0],
-                        "datum_iso": row[1],  # ISO Format für Sortierung
-                        "datum_de": row[2],    # Deutsch Format
-                        "lieferant": row[3],
-                        "gesamtpreis": row[4],
-                        "seiten": row[5],
-                        "original": row[6],
-                        "neu_name": row[7] if len(row) > 7 else ""
-                    })
-            print(f"📊 {len(bestehende_eintraege)} bestehende Einträge geladen")
-        except Exception as e:
-            print(f"⚠️  Konnte bestehende Excel nicht laden: {e}")
+    bekannte_rechnungsnummern = set()
+    monats_hoechste_nummer = defaultdict(int)
     
-    # Sammle neue erfolgreiche Einträge
-    neue_erfolgreiche = [e for e in ergebnisse if e["extrahiert"]]
+    if not os.path.exists(ziel_pfad):
+        return bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer
     
-    # Finde höchste vorhandene Nummer
-    max_nummer = 0
-    for eintrag in bestehende_eintraege:
-        try:
-            nummer = int(str(eintrag["lfd_nr"]).replace(CONFIG["prefix"], ""))
-            max_nummer = max(max_nummer, nummer)
-        except:
-            pass
+    try:
+        wb_alt = load_workbook(ziel_pfad)
+        ws_alt = wb_alt["Rechnungen"]
+        
+        for row in ws_alt.iter_rows(min_row=2, values_only=True):
+            if row[0] and row[1]:  # Lfd. Nr. und Rechnungsnummer
+                lfd_nr = str(row[0])
+                rechnungsnr = str(row[1]) if row[1] else ""
+                datum_iso = str(row[2]) if row[2] else "-"
+                
+                bestehende_eintraege.append({
+                    "lfd_nr": lfd_nr,
+                    "rechnungsnummer": rechnungsnr,
+                    "datum_iso": datum_iso,
+                    "datum_de": str(row[3]) if len(row) > 3 else "-",
+                    "lieferant": str(row[4]) if len(row) > 4 else "",
+                    "gesamtpreis": str(row[5]) if len(row) > 5 else "",
+                    "seiten": row[6] if len(row) > 6 else 0,
+                    "original": str(row[7]) if len(row) > 7 else "",
+                    "neu_name": str(row[8]) if len(row) > 8 else ""
+                })
+                
+                # Rechnungsnummer speichern für Duplikat-Check
+                if rechnungsnr and rechnungsnr != '-':
+                    bekannte_rechnungsnummern.add(rechnungsnr)
+                
+                # Monatshöchste Nummer ermitteln
+                if datum_iso != "-" and len(datum_iso) >= 7:
+                    monat_key = datum_iso[:7]  # YYYY-MM
+                    try:
+                        nummer = int(lfd_nr.replace(CONFIG["prefix"], ""))
+                        monats_hoechste_nummer[monat_key] = max(monats_hoechste_nummer[monat_key], nummer)
+                    except:
+                        pass
+        
+        print(f"📊 {len(bestehende_eintraege)} bestehende Einträge geladen")
+        print(f"   {len(bekannte_rechnungsnummern)} bekannte Rechnungsnummern im Bestand")
+        
+    except Exception as e:
+        print(f"⚠️  Konnte bestehende Excel nicht laden: {e}")
     
-    # Erstelle neue Einträge mit fortlaufender Nummerierung
+    return bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer
+
+
+def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner, bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer):
+    """Aktualisiert oder erstellt die Excel-Datei mit monatsbasierter Nummerierung"""
+    
     neue_eintraege = []
-    for idx, e in enumerate(neue_erfolgreiche, max_nummer + 1):
-        lfd_nr = f"{CONFIG['prefix']}{idx:03d}"
-        datum_iso = e["datum"]["iso"] if e["datum"] else "-"
-        # Deutsch Format: DD.MM.YYYY
-        if datum_iso != "-":
+    duplikate = []
+    
+    for e in ergebnisse:
+        if not e["extrahiert"]:
+            continue
+        
+        rechnungsnr = e.get("rechnungsnummer", "-")
+        datum_iso = e["datum"]["iso"] if e["datum"] else None
+        
+        # Duplikat-Check
+        if rechnungsnr != "-" and rechnungsnr in bekannte_rechnungsnummern:
+            duplikate.append(e)
+            continue
+        
+        # Monat ermitteln für Nummerierung
+        if datum_iso:
+            monat_key = datum_iso[:7]  # YYYY-MM
+        else:
+            monat_key = "0000-00"
+        
+        # Nächste Nummer für diesen Monat
+        monats_hoechste_nummer[monat_key] += 1
+        nummer = monats_hoechste_nummer[monat_key]
+        lfd_nr = f"{CONFIG['prefix']}{nummer:03d}"
+        
+        # Rechnungsnummer zum Bestand hinzufügen
+        if rechnungsnr != "-":
+            bekannte_rechnungsnummern.add(rechnungsnr)
+        
+        # Deutsch Format
+        if datum_iso:
             parts = datum_iso.split("-")
             datum_de = f"{parts[2]}.{parts[1]}.{parts[0]}"
         else:
             datum_de = "-"
         
-        # Neuer Dateiname für Spalte
         lieferant_safe = e["lieferant"]
         preis_str = format_betrag(e["gesamtpreis"])
-        neu_name = f"{lfd_nr}_{lieferant_safe}_{datum_iso}_{preis_str}EUR.pdf"
+        neu_name = f"{lfd_nr}_{lieferant_safe}_{datum_iso if datum_iso else '0000-00-00'}_{preis_str}EUR.pdf"
         
         neue_eintraege.append({
             "lfd_nr": lfd_nr,
-            "datum_iso": datum_iso,
+            "rechnungsnummer": rechnungsnr,
+            "datum_iso": datum_iso if datum_iso else "-",
             "datum_de": datum_de,
             "lieferant": e["lieferant"],
             "gesamtpreis": format_betrag(e["gesamtpreis"]),
             "seiten": e["seiten"],
             "original": e["datei"],
-            "neu_name": neu_name
+            "neu_name": neu_name,
+            "neu_name_duplikat": f"doppelt_{neu_name}"
         })
     
     # Alle Einträge kombinieren
     alle_eintraege = bestehende_eintraege + neue_eintraege
     
-    # Sortiere nach Datum (älteste zuerst, dann Lfd. Nr. aufsteigend)
+    # Sortiere nach Datum (älteste zuerst)
     def sort_key(e):
         datum = e["datum_iso"] if e["datum_iso"] != "-" else "0000-00-00"
-        lfd = e["lfd_nr"]
-        return (datum, lfd)
+        return datum
     
     alle_eintraege.sort(key=sort_key)
     
@@ -635,28 +609,27 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
     monats_gruppen = defaultdict(list)
     for e in alle_eintraege:
         if e["datum_iso"] != "-":
-            key = e["datum_iso"][:7]  # YYYY-MM
+            key = e["datum_iso"][:7]
             monats_gruppen[key].append(e)
         else:
             monats_gruppen["0000-00"].append(e)
     
-    # Erstelle neues Workbook
+    # Workbook erstellen
     wb = Workbook()
-    
-    # Haupt-Tabelle
     ws_haupt = wb.active
     ws_haupt.title = "Rechnungen"
     
-    # Header
-    headers = ["Lfd. Nr.", "Rechnungsdatum (ISO)", "Rechnungsdatum", "Lieferant", 
-               "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", 
+    # Header mit Rechnungsnummer
+    headers = ["Lfd. Nr.", "Rechnungsnummer", "Rechnungsdatum (ISO)", "Rechnungsdatum", 
+               "Lieferant", "Gesamtpreis inkl. MwSt (€)", "Anzahl Seiten", 
                "Ursprünglicher Dateiname", "Neuer Dateiname"]
+    
     for col, header in enumerate(headers, 1):
         cell = ws_haupt.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
         cell.fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
     
-    # Alle Daten schreiben - nach Monat gruppiert mit Summen
+    # Daten schreiben
     current_row = 2
     monats_summen = {}
     
@@ -666,15 +639,15 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
         
         for e in eintraege:
             ws_haupt.cell(row=current_row, column=1, value=e["lfd_nr"])
-            ws_haupt.cell(row=current_row, column=2, value=e["datum_iso"])
-            ws_haupt.cell(row=current_row, column=3, value=e["datum_de"])
-            ws_haupt.cell(row=current_row, column=4, value=e["lieferant"])
-            ws_haupt.cell(row=current_row, column=5, value=e["gesamtpreis"])
-            ws_haupt.cell(row=current_row, column=6, value=e["seiten"])
-            ws_haupt.cell(row=current_row, column=7, value=e["original"])
-            ws_haupt.cell(row=current_row, column=8, value=e["neu_name"])
+            ws_haupt.cell(row=current_row, column=2, value=e["rechnungsnummer"])
+            ws_haupt.cell(row=current_row, column=3, value=e["datum_iso"])
+            ws_haupt.cell(row=current_row, column=4, value=e["datum_de"])
+            ws_haupt.cell(row=current_row, column=5, value=e["lieferant"])
+            ws_haupt.cell(row=current_row, column=6, value=e["gesamtpreis"])
+            ws_haupt.cell(row=current_row, column=7, value=e["seiten"])
+            ws_haupt.cell(row=current_row, column=8, value=e["original"])
+            ws_haupt.cell(row=current_row, column=9, value=e["neu_name"])
             
-            # Summe berechnen
             try:
                 betrag_str = str(e["gesamtpreis"]).replace(".", "").replace(",", ".")
                 monats_summe += float(betrag_str)
@@ -683,7 +656,7 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
             
             current_row += 1
         
-        # Monatssumme einfügen
+        # Monatssumme
         monats_name = monat_key
         if monat_key != "0000-00":
             parts = monat_key.split("-")
@@ -693,29 +666,29 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
         sum_cell.font = Font(bold=True)
         sum_cell.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
         
-        sum_value = ws_haupt.cell(row=current_row, column=5, value=format_betrag(monats_summe))
+        sum_value = ws_haupt.cell(row=current_row, column=6, value=format_betrag(monats_summe))
         sum_value.font = Font(bold=True)
         sum_value.fill = PatternFill(start_color="E6F3FF", end_color="E6F3FF", fill_type="solid")
         
         monats_summen[monat_key] = monats_summe
         current_row += 1
     
-    # Spaltenbreiten anpassen
+    # Spaltenbreiten
     ws_haupt.column_dimensions['A'].width = 12
-    ws_haupt.column_dimensions['B'].width = 20  # ISO Datum (hidden später)
-    ws_haupt.column_dimensions['C'].width = 18  # Deutsch
-    ws_haupt.column_dimensions['D'].width = 30
-    ws_haupt.column_dimensions['E'].width = 25
-    ws_haupt.column_dimensions['F'].width = 15
-    ws_haupt.column_dimensions['G'].width = 45
-    ws_haupt.column_dimensions['H'].width = 50
+    ws_haupt.column_dimensions['B'].width = 25  # Rechnungsnummer
+    ws_haupt.column_dimensions['C'].width = 20
+    ws_haupt.column_dimensions['D'].width = 18
+    ws_haupt.column_dimensions['E'].width = 30
+    ws_haupt.column_dimensions['F'].width = 25
+    ws_haupt.column_dimensions['G'].width = 15
+    ws_haupt.column_dimensions['H'].width = 45
+    ws_haupt.column_dimensions['I'].width = 50
     
-    # ISO-Spalte verstecken (nur für interne Sortierung)
-    ws_haupt.column_dimensions['B'].hidden = True
+    # ISO-Spalte verstecken
+    ws_haupt.column_dimensions['C'].hidden = True
     
     # Monatsauswertung
     ws_monat = wb.create_sheet("Monatsauswertung")
-    
     for col, header in enumerate(["Jahr-Monat", "Monatsname", "Anzahl Rechnungen", "Gesamtsumme (€)"], 1):
         cell = ws_monat.cell(row=1, column=col, value=header)
         cell.font = Font(bold=True)
@@ -765,12 +738,11 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner):
     
     wb.save(ziel_pfad)
     
-    return len(neue_eintraege), len(alle_eintraege)
+    return len(neue_eintraege), len(alle_eintraege), duplikate
 
 
 def main():
     """Hauptfunktion"""
-    # Ordner ist automatisch der Ordner, in dem das Script/.exe liegt
     quell_ordner = os.getcwd()
     
     print(f"📁 Verarbeite PDFs in: {quell_ordner}\n")
@@ -781,16 +753,20 @@ def main():
         print("ℹ️  OCR nicht verfügbar - nur digitale PDFs können verarbeitet werden")
         print("   (pip install pdf2image pytesseract für OCR-Support)\n")
     
+    # Lade bestehende Excel für Duplikat-Check und Nummerierung
+    excel_pfad = os.path.join(quell_ordner, CONFIG["excel_datei"])
+    bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer = lade_excel_bestand(excel_pfad)
+    
     # Finde alle PDFs (ohne bereits umbenannte)
     prefix_lower = CONFIG["prefix"].lower()
     dateien = [
         os.path.join(quell_ordner, f) for f in os.listdir(quell_ordner)
-        if f.lower().endswith('.pdf') and not f.lower().startswith(prefix_lower)
+        if f.lower().endswith('.pdf') and not f.lower().startswith(prefix_lower) and not f.lower().startswith('doppelt_')
     ]
     
     if not dateien:
         print("⚠️  Keine neuen PDF-Dateien gefunden.")
-        print("   (Dateien mit '26-' am Anfang werden übersprungen)")
+        print("   (Dateien mit '26-' oder 'doppelt_' am Anfang werden übersprungen)")
         return
     
     print(f"📄 {len(dateien)} neue PDF(s) gefunden. Verarbeite...\n")
@@ -805,19 +781,31 @@ def main():
         ergebnisse.append(daten)
         
         if daten["extrahiert"]:
-            neuer_name = generiere_dateiname(daten, i)
-            daten["neuer_name"] = neuer_name
+            # Prüfe Duplikat
+            rechnungsnr = daten.get("rechnungsnummer", "-")
+            ist_duplikat = rechnungsnr != "-" and rechnungsnr in bekannte_rechnungsnummern
             
-            ziel_pfad = os.path.join(quell_ordner, neuer_name)
+            if ist_duplikat:
+                neuer_name = generiere_dateiname(daten, 0, ist_duplikat=True)
+                daten["neuer_name"] = neuer_name
+                daten["ist_duplikat"] = True
+                print(f"  ⚠️  Duplikat erkannt (Rechnungsnr: {rechnungsnr})")
+            else:
+                # Normale Nummerierung (wird später in erstelle_excel ermittelt)
+                neuer_name = generiere_dateiname(daten, 0)
+                daten["neuer_name"] = neuer_name
+                daten["ist_duplikat"] = False
             
-            # Umbenennen
+            ziel_pfad_datei = os.path.join(quell_ordner, neuer_name)
+            
             try:
-                os.rename(pfad, ziel_pfad)
+                os.rename(pfad, ziel_pfad_datei)
                 print(f"  ✅ {neuer_name}")
             except Exception as e:
                 print(f"  ⚠️  Konnte nicht umbenennen: {e}")
             
             print(f"     Lieferant: {daten['lieferant']}")
+            print(f"     Rechnungsnr: {daten['rechnungsnummer']}")
             print(f"     Datum: {daten['datum']['iso'] if daten['datum'] else '-'}")
             print(f"     Gesamtpreis: {format_betrag(daten['gesamtpreis'])} € (Brutto)")
             if daten.get("ocr_verwendet"):
@@ -829,23 +817,26 @@ def main():
         print()
     
     # Excel erstellen
-    excel_pfad = os.path.join(quell_ordner, CONFIG["excel_datei"])
-    neue_eintraege, gesamt_eintraege = erstelle_excel(ergebnisse, excel_pfad, quell_ordner)
+    neue_eintraege, gesamt_eintraege, duplikate = erstelle_excel(
+        ergebnisse, excel_pfad, quell_ordner, 
+        bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer
+    )
     
     # Zusammenfassung
     erfolgreich = len([e for e in ergebnisse if e["extrahiert"]])
     fehler = len([e for e in ergebnisse if not e["extrahiert"]])
-    gesamt_summe = sum(e["gesamtpreis"] for e in ergebnisse if e["extrahiert"])
+    gesamt_summe = sum(e["gesamtpreis"] for e in ergebnisse if e["extrahiert"] and not e.get("ist_duplikat", False))
     
     print("\n📊 Zusammenfassung:")
-    print(f"   Neue Rechnungen: {erfolgreich}")
+    print(f"   Verarbeitet: {erfolgreich}")
+    print(f"   Neue Rechnungen: {neue_eintraege}")
+    print(f"   Duplikate: {len(duplikate)}")
     print(f"   Fehler: {fehler}")
     print(f"   Gesamtsumme (neu): {format_betrag(gesamt_summe)} €")
     print(f"\n📂 Excel aktualisiert: {CONFIG['excel_datei']}")
     print(f"   {neue_eintraege} neue Einträge hinzugefügt")
     print(f"   {gesamt_eintraege} Einträge insgesamt")
     
-    # Warte auf Tastendruck
     print("\n-------------------------------------------")
     print("Drücken Sie Enter zum Beenden...")
     input()
