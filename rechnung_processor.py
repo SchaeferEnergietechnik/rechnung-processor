@@ -539,7 +539,7 @@ def lade_excel_bestand(ziel_pfad):
 
 
 def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner, bestehende_eintraege, bekannte_rechnungsnummern, monats_hoechste_nummer):
-    """Aktualisiert oder erstellt die Excel-Datei mit monatsbasierter Nummerierung"""
+    """Aktualisiert oder erstellt die Excel-Datei - Nummern kommen aus den bereits umbenannten Dateien"""
     
     neue_eintraege = []
     duplikate = []
@@ -551,12 +551,43 @@ def erstelle_excel(ergebnisse, ziel_pfad, quell_ordner, bestehende_eintraege, be
         rechnungsnr = e.get("rechnungsnummer", "-")
         datum_iso = e["datum"]["iso"] if e["datum"] else None
         
-        # Duplikat-Check
+        # Duplikat-Check (sollte hier nicht mehr vorkommen, aber sicher ist sicher)
         if rechnungsnr != "-" and rechnungsnr in bekannte_rechnungsnummern:
             duplikate.append(e)
             continue
         
-        # Monat ermitteln für Nummerierung
+        # Nummer aus dem bereits generierten Dateinamen extrahieren
+        neuer_name = e.get("neuer_name", "")
+        lfd_nr = e.get("lfd_nr", "")
+        
+        if not lfd_nr and neuer_name:
+            # Fallback: Extrahiere aus Dateinamen (z.B. "26-001_Amazon_...")
+            match = re.match(r'(?:doppelt_)?(\d+-\d{3})_', neuer_name)
+            if match:
+                lfd_nr = match.group(1)
+        
+        if not lfd_nr:
+            lfd_nr = "26-000"  # Fallback
+        
+        # Deutsch Format
+        if datum_iso:
+            parts = datum_iso.split("-")
+            datum_de = f"{parts[2]}.{parts[1]}.{parts[0]}"
+        else:
+            datum_de = "-"
+        
+        neue_eintraege.append({
+            "lfd_nr": lfd_nr,
+            "rechnungsnummer": rechnungsnr,
+            "datum_iso": datum_iso if datum_iso else "-",
+            "datum_de": datum_de,
+            "lieferant": e["lieferant"],
+            "gesamtpreis": format_betrag(e["gesamtpreis"]),
+            "seiten": e["seiten"],
+            "original": e["datei"],
+            "neu_name": neuer_name,
+            "neu_name_duplikat": f"doppelt_{neuer_name}" if not neuer_name.startswith("doppelt_") else neuer_name
+        })
         if datum_iso:
             monat_key = datum_iso[:7]  # YYYY-MM
         else:
@@ -771,36 +802,49 @@ def main():
     
     print(f"📄 {len(dateien)} neue PDF(s) gefunden. Verarbeite...\n")
     
-    # Verarbeite alle PDFs
+    # Verarbeite alle PDFs und ermittle Nummern VOR dem Umbenennen
     ergebnisse = []
+    monats_nummern_counter = defaultdict(int)  # Temporär für Nummernvergabe
+    
     for i, pfad in enumerate(dateien, 1):
         datei_name = os.path.basename(pfad)
         print(f"[{i}/{len(dateien)}] {datei_name}...")
         
         daten = verarbeite_pdf(pfad)
-        ergebnisse.append(daten)
         
         if daten["extrahiert"]:
-            # Prüfe Duplikat
             rechnungsnr = daten.get("rechnungsnummer", "-")
-            ist_duplikat = rechnungsnr != "-" and rechnungsnr in bekannte_rechnungsnummern
+            datum_iso = daten["datum"]["iso"] if daten["datum"] else None
             
-            if ist_duplikat:
-                neuer_name = generiere_dateiname(daten, 0, ist_duplikat=True)
-                daten["neuer_name"] = neuer_name
+            # Duplikat-Check
+            if rechnungsnr != "-" and rechnungsnr in bekannte_rechnungsnummern:
                 daten["ist_duplikat"] = True
+                daten["neuer_name"] = generiere_dateiname(daten, 0, ist_duplikat=True)
                 print(f"  ⚠️  Duplikat erkannt (Rechnungsnr: {rechnungsnr})")
             else:
-                # Normale Nummerierung (wird später in erstelle_excel ermittelt)
-                neuer_name = generiere_dateiname(daten, 0)
-                daten["neuer_name"] = neuer_name
+                # Monat ermitteln für Nummerierung
+                if datum_iso:
+                    monat_key = datum_iso[:7]
+                else:
+                    monat_key = "0000-00"
+                
+                # Nummer aus Excel-Bestand + aktuelle Dateien
+                aktuelle_nummer = monats_hoechste_nummer.get(monat_key, 0) + monats_nummern_counter[monat_key] + 1
+                monats_nummern_counter[monat_key] += 1
+                
                 daten["ist_duplikat"] = False
+                daten["neuer_name"] = generiere_dateiname(daten, aktuelle_nummer)
+                daten["lfd_nr"] = f"{CONFIG['prefix']}{aktuelle_nummer:03d}"
+                
+                # Rechnungsnummer zum Bestand hinzufügen
+                if rechnungsnr != "-":
+                    bekannte_rechnungsnummern.add(rechnungsnr)
             
-            ziel_pfad_datei = os.path.join(quell_ordner, neuer_name)
-            
+            # Jetzt umbenennen mit korrekter Nummer
+            ziel_pfad_datei = os.path.join(quell_ordner, daten["neuer_name"])
             try:
                 os.rename(pfad, ziel_pfad_datei)
-                print(f"  ✅ {neuer_name}")
+                print(f"  ✅ {daten['neuer_name']}")
             except Exception as e:
                 print(f"  ⚠️  Konnte nicht umbenennen: {e}")
             
@@ -814,6 +858,8 @@ def main():
             print(f"  ⚠️  Übersprungen: {daten['hinweis']}")
         else:
             print(f"  ❌ Fehler: {daten.get('fehler', 'Unbekannt')}")
+        
+        ergebnisse.append(daten)
         print()
     
     # Excel erstellen
